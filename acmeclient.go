@@ -68,12 +68,12 @@ func (iss *ACMEIssuer) newACMEClientWithAccount(ctx context.Context, useTestCA, 
 
 		// synchronize this so the account is only created once
 		acctLockKey := accountRegLockKey(account)
-		err = acquireLock(ctx, iss.config.Storage, acctLockKey)
+		acctLock, err := acquireLock(ctx, iss.config.Storage, acctLockKey)
 		if err != nil {
 			return nil, fmt.Errorf("locking account registration: %v", err)
 		}
 		defer func() {
-			if err := releaseLock(ctx, iss.config.Storage, acctLockKey); err != nil {
+			if err := releaseLock(ctx, acctLock); err != nil {
 				iss.Logger.Error("failed to unlock account registration lock", zap.Error(err))
 			}
 		}()

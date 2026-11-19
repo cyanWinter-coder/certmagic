@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"os"
 	"reflect"
 	"testing"
@@ -146,6 +147,39 @@ func TestRenewLockLeaseWithoutInterface(t *testing.T) {
 	cfg := &Config{Logger: defaultTestLogger}
 	err = cfg.renewLockLease(ctx, storage, "test-lock", 0)
 	testutil.RequireNoError(t, err)
+}
+
+// TestRenewLockLeaseThroughHandleUsesOwner verifies that when a lock was
+// acquired through this package, renewLockLease renews through its handle,
+// passing the acquisition's owner token to the storage, and that a failed
+// renewal marks the handle lost (requirements 1 and 2).
+func TestRenewLockLeaseThroughHandleUsesOwner(t *testing.T) {
+	ctx := context.Background()
+	storage := newLeaseTestStorage(t)
+
+	lock, err := acquireLock(ctx, storage, "test-lock")
+	if err != nil {
+		t.Fatalf("acquiring lock: %v", err)
+	}
+	defer releaseLock(ctx, lock)
+
+	cfg := &Config{Logger: defaultTestLogger}
+	if err := cfg.renewLockLease(ctx, storage, "test-lock", 0); err != nil {
+		t.Fatalf("renewLockLease through handle: %v", err)
+	}
+	if err := lock.Err(); err != nil {
+		t.Fatalf("handle should still be valid after successful renewal: %v", err)
+	}
+
+	storage.mu.Lock()
+	storage.loseNext = true
+	storage.mu.Unlock()
+	if err := cfg.renewLockLease(ctx, storage, "test-lock", 1); !errors.Is(err, ErrLockLeaseLost) {
+		t.Fatalf("expected ErrLockLeaseLost, got: %v", err)
+	}
+	if err := lock.Err(); !errors.Is(err, ErrLockLeaseLost) {
+		t.Fatalf("expected handle to be marked lost, got: %v", err)
+	}
 }
 
 func mustJSON(val any) []byte {

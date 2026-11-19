@@ -497,23 +497,35 @@ func (cfg *Config) updateARI(ctx context.Context, cert Certificate, logger *zap.
 
 	// synchronize ARI fetching; see #297
 	lockName := "ari_" + cert.ari.UniqueIdentifier
+	var ariLock *lockHandle
 	if _, ok := cfg.Storage.(TryLocker); ok {
-		ok, err := tryAcquireLock(ctx, cfg.Storage, lockName)
+		var gotLock bool
+		var err error
+		ariLock, gotLock, err = tryAcquireLock(ctx, cfg.Storage, lockName)
 		if err != nil {
 			return cert, false, fmt.Errorf("unable to obtain ARI lock: %v", err)
 		}
-		if !ok {
+		if !gotLock {
 			logger.Debug("attempted to obtain ARI lock but it was already taken")
 			return cert, false, nil
 		}
-	} else if err := acquireLock(ctx, cfg.Storage, lockName); err != nil {
-		return cert, false, fmt.Errorf("unable to obtain ARI lock: %v", err)
+	} else {
+		var err error
+		ariLock, err = acquireLock(ctx, cfg.Storage, lockName)
+		if err != nil {
+			return cert, false, fmt.Errorf("unable to obtain ARI lock: %v", err)
+		}
 	}
 	defer func() {
-		if err := releaseLock(ctx, cfg.Storage, lockName); err != nil {
+		if err := releaseLock(ctx, ariLock); err != nil {
 			logger.Error("unable to release ARI lock", zap.Error(err))
 		}
 	}()
+
+	// the lock may have been taken over while we waited if the lease was lost
+	if err := ariLock.ensureValid(ctx); err != nil {
+		return cert, false, fmt.Errorf("ARI lock lease was lost: %w", err)
+	}
 
 	// see if the stored value has been refreshed already by another instance
 	gotNewARI, newARI, err := cfg.storageHasNewerARI(ctx, cert)
@@ -634,6 +646,13 @@ func (cfg *Config) updateARI(ctx context.Context, cert Certificate, logger *zap.
 				err = fmt.Errorf("got new ARI from %s, but could not re-encode certificate metadata: %v", iss.IssuerKey(), err)
 				return
 			}
+			// publishing this update is only safe while we can still prove we
+			// hold the lock: if the lease was lost, another worker may have
+			// taken over and written newer information
+			if err = ariLock.ensureValid(ctx); err != nil {
+				err = fmt.Errorf("not storing ARI update from %s because the lock lease was lost: %w", iss.IssuerKey(), err)
+				return
+			}
 			if err = cfg.Storage.Store(ctx, StorageKeys.SiteMeta(cert.issuerKey, cert.Names[0]), certResBytes); err != nil {
 				err = fmt.Errorf("got new ARI from %s, but could not store it with certificate metadata: %v", iss.IssuerKey(), err)
 				return
@@ -687,11 +706,12 @@ func CleanStorage(ctx context.Context, storage Storage, opts CleanStorageOptions
 	opts.Logger = opts.Logger.With(zap.Any("storage", storage))
 
 	// storage cleaning should be globally exclusive
-	if err := acquireLock(ctx, storage, lockName); err != nil {
+	cleanLock, err := acquireLock(ctx, storage, lockName)
+	if err != nil {
 		return fmt.Errorf("unable to acquire %s lock: %v", lockName, err)
 	}
 	defer func() {
-		if err := releaseLock(ctx, storage, lockName); err != nil {
+		if err := releaseLock(ctx, cleanLock); err != nil {
 			opts.Logger.Error("unable to release lock", zap.Error(err))
 			return
 		}

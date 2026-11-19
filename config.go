@@ -584,6 +584,12 @@ func (cfg *Config) manageOne(ctx context.Context, domainName string, async bool)
 // backend supports it. The lease duration is calculated based on the retry attempt
 // number and includes the certificate obtain timeout. This prevents locks from
 // expiring during long-running certificate operations with retries.
+//
+// When the lock was acquired through this package, renewal goes through its lock
+// handle, which records lease loss so that checkpoints in the protected flow
+// stop (and refuse to publish results) instead of racing a worker that may have
+// taken over the lock. The goroutine that keeps the lease alive is started and
+// stopped with the handle; this only changes the duration it requests.
 func (cfg *Config) renewLockLease(ctx context.Context, storage Storage, lockKey string, attempt int) error {
 	l, ok := storage.(LockLeaseRenewer)
 	if !ok {
@@ -598,13 +604,18 @@ func (cfg *Config) renewLockLease(ctx context.Context, storage Storage, lockKey 
 	log := cfg.Logger.Named("renewLockLease")
 	log.Debug("renewing lock lease", zap.String("lockKey", lockKey), zap.Int("attempt", attempt))
 
-	err := l.RenewLockLease(ctx, lockKey, leaseDuration)
-	if err == nil {
-		locksMu.Lock()
-		locks[lockKey] = storage
-		locksMu.Unlock()
+	locksMu.Lock()
+	handle := locks[lockKey]
+	locksMu.Unlock()
+	if handle != nil {
+		// Renewing through the handle records lease loss, so the protected
+		// flow stops instead of publishing work done without the lock.
+		return handle.renewWith(ctx, leaseDuration)
 	}
-	return err
+
+	// No handle is registered for this key (e.g. a caller renewing a lease it
+	// obtained elsewhere); renew directly.
+	return l.RenewLockLease(ctx, lockKey, leaseDuration)
 }
 
 // ObtainCertSync generates a new private key and obtains a certificate for
@@ -647,13 +658,13 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 
 	// ensure idempotency of the obtain operation for this name
 	lockKey := cfg.lockKey(certIssueLockOp, name)
-	err = acquireLock(ctx, cfg.Storage, lockKey)
+	lock, err := acquireLock(ctx, cfg.Storage, lockKey)
 	if err != nil {
 		return fmt.Errorf("unable to acquire lock '%s': %v", lockKey, err)
 	}
 	defer func() {
 		log.Info("releasing lock", zap.String("identifier", name))
-		if err := releaseLock(ctx, cfg.Storage, lockKey); err != nil {
+		if err := releaseLock(ctx, lock); err != nil {
 			log.Error("unable to unlock",
 				zap.String("identifier", name),
 				zap.String("lock_key", lockKey),
@@ -668,8 +679,14 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 		if ok {
 			err = cfg.renewLockLease(ctx, cfg.Storage, lockKey, *attempt)
 			if err != nil {
-				return fmt.Errorf("unable to renew lock lease '%s': %v", lockKey, err)
+				return fmt.Errorf("unable to renew lock lease '%s': %w", lockKey, err)
 			}
+		}
+
+		// an earlier renewal (including the background one) may have lost the
+		// lease; do not start expensive work without it
+		if err := lock.ensureValid(ctx); err != nil {
+			return err
 		}
 
 		// check if obtain is still needed -- might have been obtained during lock
@@ -779,6 +796,13 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 			return fmt.Errorf("[%s] Obtain: %w", name, err)
 		}
 		issuerKey := issuerUsed.IssuerKey()
+
+		// Publishing is only safe while we can still prove we hold the lock:
+		// if the lease was lost, another worker may have taken over, and its
+		// artifacts must not be overwritten with ours.
+		if err := lock.ensureValid(ctx); err != nil {
+			return fmt.Errorf("[%s] Obtain: not saving assets because the lock lease was lost: %w", name, err)
+		}
 
 		// success - immediately save the certificate resource
 		metaJSON, err := json.Marshal(issuedCert.Metadata)
@@ -949,14 +973,14 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, retry, int
 
 	// ensure idempotency of the renew operation for this name
 	lockKey := cfg.lockKey(certIssueLockOp, name)
-	err = acquireLock(ctx, cfg.Storage, lockKey)
+	lock, err := acquireLock(ctx, cfg.Storage, lockKey)
 	if err != nil {
 		return fmt.Errorf("unable to acquire lock '%s': %v", lockKey, err)
 	}
 	defer func() {
 		log.Info("releasing lock", zap.String("identifier", name))
 
-		if err := releaseLock(ctx, cfg.Storage, lockKey); err != nil {
+		if err := releaseLock(ctx, lock); err != nil {
 			log.Error("unable to unlock",
 				zap.String("identifier", name),
 				zap.String("lock_key", lockKey),
@@ -972,8 +996,14 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, retry, int
 		if ok {
 			err = cfg.renewLockLease(ctx, cfg.Storage, lockKey, *attempt)
 			if err != nil {
-				return fmt.Errorf("unable to renew lock lease '%s': %v", lockKey, err)
+				return fmt.Errorf("unable to renew lock lease '%s': %w", lockKey, err)
 			}
+		}
+
+		// an earlier renewal (including the background one) may have lost the
+		// lease; do not start expensive work without it
+		if err := lock.ensureValid(ctx); err != nil {
+			return err
 		}
 
 		// prepare for renewal (load PEM cert, key, and meta); we hold the lock,
@@ -1106,6 +1136,13 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, retry, int
 			return fmt.Errorf("[%s] Renew: %w", name, err)
 		}
 		issuerKey := issuerUsed.IssuerKey()
+
+		// Publishing the renewed certificate is only safe while we can prove we
+		// still hold the lock: if the lease was lost, another worker may have
+		// taken over and its artifacts must not be overwritten with ours.
+		if err := lock.ensureValid(ctx); err != nil {
+			return fmt.Errorf("[%s] Renew: not saving assets because the lock lease was lost: %w", name, err)
+		}
 
 		// success - immediately save the renewed certificate resource
 		metaJSON, err := json.Marshal(issuedCert.Metadata)

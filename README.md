@@ -466,6 +466,8 @@ The notion of a "cluster" or "fleet" of instances that may be serving the same s
 
 The easiest way to change the storage being used is to set `certmagic.Default.Storage` to a value that satisfies the [Storage interface](https://pkg.go.dev/github.com/caddyserver/certmagic?tab=doc#Storage). Keep in mind that a valid `Storage` must be able to implement some operations atomically in order to provide locking and synchronization.
 
+Storage backends that use expiring leases for locks can additionally implement `LockLeaseRenewer`. CertMagic then renews the lease in the background for the lifetime of the lock, and the protected work stops (and refuses to publish its results) if a renewal fails, since another instance may have taken over in the meantime. `RenewLockLease` must return `ErrLockLeaseLost` once the caller's lease is no longer held. To let the backend distinguish its own acquisitions, CertMagic installs a unique owner token on the context before acquiring a lock; `LockOwnerFromContext` reads it, and implementations that can persist and verify it should do so, so that a stale owner can never renew or release a successor's lock. Backends that do not implement lease renewal keep working exactly as before.
+
 If you write a Storage implementation, please add it to the [project wiki](https://github.com/caddyserver/certmagic/wiki/Storage-Implementations) so people can find it!
 
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"math/big"
 	"sync/atomic"
@@ -156,5 +157,80 @@ func TestQueueRenewalTaskPacesRetriesItself(t *testing.T) {
 	}
 	if !waitUntil(time.Second, func() bool { return issuer.calls.Load() == 2 }) {
 		t.Fatalf("expected a second issuance attempt once the backoff interval elapsed, got %d", issuer.calls.Load())
+	}
+}
+
+// leaseLostIssuer is a fake Issuer that succeeds, but loses the lock lease
+// (via the supplied callback) at the moment it issues, simulating a lease that
+// expired or was taken over while the CA was working. It lets tests verify that
+// the renewed certificate is not published afterwards.
+type leaseLostIssuer struct {
+	key     string
+	onIssue func()
+	pem     []byte
+}
+
+func (li *leaseLostIssuer) IssuerKey() string { return li.key }
+
+func (li *leaseLostIssuer) Issue(context.Context, *x509.CertificateRequest) (*IssuedCertificate, error) {
+	if li.onIssue != nil {
+		li.onIssue()
+	}
+	return &IssuedCertificate{Certificate: li.pem}, nil
+}
+
+// TestRenewCertRefusesPublicationAfterLeaseLoss is the end-to-end counterpart of
+// TestLeaseLockRenewalFailureStopsPublication: when the lock lease is lost while
+// renewal is in progress, the renewed certificate must not be written to storage
+// (requirement 5), and the flow must report the lost lease (requirement 2).
+func TestRenewCertRefusesPublicationAfterLeaseLoss(t *testing.T) {
+	ctx := context.Background()
+	const domain = "example.com"
+
+	storage := newLeaseTestStorage(t)
+	issuer := &leaseLostIssuer{key: "lease-lost-issuer"}
+	issuer.pem = []byte("this must never be saved")
+
+	certCache := &Cache{
+		cache:      make(map[string]Certificate),
+		cacheIndex: make(map[string][]string),
+		logger:     defaultTestLogger,
+	}
+	cfg := &Config{
+		Issuers:          []Issuer{issuer},
+		Storage:          storage,
+		Logger:           defaultTestLogger,
+		DisableARI:       true,
+		ReusePrivateKeys: true,
+		certCache:        certCache,
+	}
+	cfg.OCSP.DisableStapling = true
+
+	// Seed an already-expired certificate so renewal is needed.
+	certRes := testIssuedCertResource(t, issuer, domain, time.Now().Add(-60*24*time.Hour))
+	if err := cfg.saveCertResource(ctx, issuer, certRes); err != nil {
+		t.Fatalf("seeding cert resource: %v", err)
+	}
+
+	// Loss reported from inside Issue() happens after the pre-work checkpoint
+	// but before publication, which is exactly the window under test.
+	issuer.onIssue = func() {
+		storage.mu.Lock()
+		storage.loseNext = true
+		storage.mu.Unlock()
+	}
+
+	err := cfg.RenewCertSync(ctx, domain, true)
+	if !errors.Is(err, ErrLockLeaseLost) {
+		t.Fatalf("expected renewal to report ErrLockLeaseLost, got: %v", err)
+	}
+
+	// The seeded resource must be unchanged: the new cert was never published.
+	loaded, err := cfg.loadCertResource(ctx, issuer, domain, cfg.groundTruthStorage())
+	if err != nil {
+		t.Fatalf("loading cert resource: %v", err)
+	}
+	if string(loaded.CertificatePEM) == string(issuer.pem) {
+		t.Fatal("renewed certificate was published even though the lock lease was lost")
 	}
 }

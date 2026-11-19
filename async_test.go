@@ -280,3 +280,27 @@ func TestRenewalBackoffSchedule(t *testing.T) {
 		t.Fatal("expected name to be immediately ready again after the retry budget was exhausted")
 	}
 }
+
+// TestDoWithRetryStopsOnLockLeaseLost verifies that doWithRetry does not keep
+// retrying after the lock lease is lost: the handle cannot become valid again
+// by waiting, and another worker may already own the lock.
+func TestDoWithRetryStopsOnLockLeaseLost(t *testing.T) {
+	logger := zap.NewNop()
+	ctx := context.Background()
+
+	originalIntervals := retryIntervals
+	retryIntervals = []time.Duration{10 * time.Millisecond}
+	t.Cleanup(func() { retryIntervals = originalIntervals })
+
+	attempts := 0
+	err := doWithRetry(ctx, logger, func(context.Context) error {
+		attempts++
+		return fmt.Errorf("renewing: %w", ErrLockLeaseLost)
+	})
+	if !errors.Is(err, ErrLockLeaseLost) {
+		t.Fatalf("expected ErrLockLeaseLost, got: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("expected no retries after lease loss, got %d attempts", attempts)
+	}
+}

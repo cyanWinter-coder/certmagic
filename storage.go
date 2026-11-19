@@ -16,11 +16,15 @@ package certmagic
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"path"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -172,11 +176,54 @@ type TryLocker interface {
 // LockLeaseRenewer is an optional interface that can be implemented by a Storage
 // implementation to support renewing the lease on a lock. This is useful for
 // long-running operations that need to be synchronized across a cluster.
+//
+// A lease is not ownership by itself. Renewals and releases must act only on a
+// lock the caller still holds: once a lease expired, was taken over, or was
+// released, RenewLockLease must fail with ErrLockLeaseLost rather than extending
+// (or otherwise touching) whatever lock record now exists under that name.
+//
+// Implementations that can record an owner should read it from the context with
+// LockOwnerFromContext and persist it with the lock record, then verify it
+// before renewing or releasing. That way a slow or stale owner can never renew
+// or delete its successor's lock. Implementations that cannot record an owner
+// may ignore the context value; they remain valid.
 type LockLeaseRenewer interface {
 	// RenewLockLease renews the lease on the lock for the given lockKey for the
 	// given leaseDuration. This is used to prevent the lock from being acquired
 	// by another process.
+	//
+	// If the context carries an owner (see LockOwnerFromContext), only that
+	// owner may renew the lock. The call must return ErrLockLeaseLost if the
+	// lock is no longer held by the caller.
 	RenewLockLease(ctx context.Context, lockKey string, leaseDuration time.Duration) error
+}
+
+// ErrLockLeaseLost indicates that the caller no longer owns a lock lease,
+// because it expired, was taken over, or was released. It is returned by
+// LockLeaseRenewer implementations and used internally to signal that work done
+// under the lock must stop and must not be published.
+var ErrLockLeaseLost = errors.New("lock lease lost")
+
+// lockOwnerCtxKey carries the owner token of a lock acquisition. It is placed
+// on the context passed to Lock, TryLock, RenewLockLease, and Unlock so that
+// storage implementations supporting ownership can record and verify it without
+// changing the Locker interface; implementations that are unaware of it keep
+// working exactly as before.
+type lockOwnerCtxKey struct{}
+
+// LockOwnerFromContext returns the owner token of the lock acquisition that the
+// context belongs to, if any. Storage implementations that record an owner for
+// each lock should persist this value and verify it before renewing or
+// releasing the lock, so that a stale owner cannot affect a successor's lock.
+func LockOwnerFromContext(ctx context.Context) (string, bool) {
+	owner, ok := ctx.Value(lockOwnerCtxKey{}).(string)
+	return owner, ok && owner != ""
+}
+
+// withLockOwner returns a context carrying owner for calls into the storage
+// backend's locking methods.
+func withLockOwner(ctx context.Context, owner string) context.Context {
+	return context.WithValue(ctx, lockOwnerCtxKey{}, owner)
 }
 
 // KeyInfo holds information about a key in storage.
@@ -295,58 +342,363 @@ func (keys KeyBuilder) Safe(str string) string {
 // Errors are only reported if a logger is given.
 func CleanUpOwnLocks(ctx context.Context, logger *zap.Logger) {
 	locksMu.Lock()
-	defer locksMu.Unlock()
-	for lockKey, storage := range locks {
-		if err := storage.Unlock(ctx, lockKey); err != nil {
+	handles := make([]*lockHandle, 0, len(locks))
+	for _, handle := range locks {
+		handles = append(handles, handle)
+	}
+	locksMu.Unlock()
+
+	for _, handle := range handles {
+		if err := releaseLock(ctx, handle); err != nil {
 			logger.Error("unable to clean up lock in storage backend",
-				zap.Any("storage", storage),
-				zap.String("lock_key", lockKey),
+				zap.Any("storage", handle.storage),
+				zap.String("lock_key", handle.lockKey),
 				zap.Error(err))
-			continue
 		}
-		delete(locks, lockKey)
 	}
 }
 
-func acquireLock(ctx context.Context, storage Storage, lockKey string) error {
-	err := storage.Lock(ctx, lockKey)
-	if err == nil {
-		locksMu.Lock()
-		locks[lockKey] = storage
-		locksMu.Unlock()
-	}
-	return err
+// lockHandle represents one successful acquisition of a named lock by this
+// process. Every acquisition gets a fresh owner token so that a release or
+// renewal performed after the lock was lost and re-acquired cannot act on the
+// successor's lock.
+//
+// For storages that implement LockLeaseRenewer, the handle also owns the
+// goroutine that keeps the lease alive for as long as the protected work runs.
+type lockHandle struct {
+	storage Storage
+	lockKey string
+	owner   string
+
+	// leased is true when the storage implements LockLeaseRenewer; only then
+	// does the handle participate in lease ownership semantics.
+	leased bool
+
+	mu            sync.Mutex
+	renewMu       sync.Mutex // serializes renewals for this handle
+	lost          bool
+	leaseDuration time.Duration
+	cancel        context.CancelFunc
+	done          chan struct{}
 }
 
-func tryAcquireLock(ctx context.Context, storage Storage, lockKey string) (bool, error) {
+// Err returns ErrLockLeaseLost (wrapped) if the handle's lease is no longer
+// known to be valid. Callers must consult this at safety checkpoints: after a
+// renewal failure, work done under the lock must stop and must not be
+// published, because another worker may have taken over the lock meanwhile.
+func (h *lockHandle) Err() error {
+	if h == nil || !h.leased {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.lost {
+		return fmt.Errorf("%w: lock %q", ErrLockLeaseLost, h.lockKey)
+	}
+	return nil
+}
+
+// markLost records that the lock lease is no longer provably held. It reports
+// whether this call made the transition, so the loss is logged only once.
+func (h *lockHandle) markLost() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.lost {
+		return false
+	}
+	h.lost = true
+	return true
+}
+
+// stopRenewal cancels the lease renewal goroutine, if any, and waits for it to
+// exit, so a finished task leaves no goroutine behind. It is safe to call more
+// than once (and concurrently): only one caller cancels, but every caller waits
+// for the goroutine to actually finish.
+func (h *lockHandle) stopRenewal() {
+	h.mu.Lock()
+	cancel, done := h.cancel, h.done
+	h.cancel = nil
+	h.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+// renewWith renews the lock's lease for leaseDuration and marks the handle lost
+// if renewal fails. A failed renewal means the lease may already have expired,
+// so it is no longer safe to treat the lock as held. It also records
+// leaseDuration as the duration the renewal goroutine should keep asking for,
+// since retries extend how long the protected work may take.
+//
+// Renewal is refused if this handle is no longer the registered owner of the
+// lock: a stale handle must never extend (or otherwise touch) a lease now held
+// by a successor.
+func (h *lockHandle) renewWith(ctx context.Context, leaseDuration time.Duration) error {
+	if !h.leased {
+		return nil
+	}
+
+	// Only one renewal may be in flight at a time, so that a slow background
+	// renewal cannot interleave with a checkpoint renewal or a release.
+	h.renewMu.Lock()
+	defer h.renewMu.Unlock()
+
+	locksMu.Lock()
+	current := locks[h.lockKey]
+	locksMu.Unlock()
+	if current != h {
+		h.markLost()
+		return fmt.Errorf("%w: lock %q was re-acquired by another worker", ErrLockLeaseLost, h.lockKey)
+	}
+
+	h.mu.Lock()
+	h.leaseDuration = leaseDuration
+	h.mu.Unlock()
+
+	renewer := h.storage.(LockLeaseRenewer)
+	err := renewer.RenewLockLease(withLockOwner(ctx, h.owner), h.lockKey, leaseDuration)
+	if err != nil {
+		// Cancellation (e.g. the operation ended, or the renewal goroutine is
+		// being stopped by release) says nothing about the lease itself, so it
+		// must not be mistaken for lease loss -- unless the backend explicitly
+		// reports the lease lost.
+		if !errors.Is(err, ErrLockLeaseLost) &&
+			(ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			return err
+		}
+		if h.markLost() {
+			defaultLogger.Sugar().Errorf("lock lease lost for %s (owner %s): %v - stopping protected work because another worker may hold the lock", h.lockKey, h.owner, err)
+		}
+		if !errors.Is(err, ErrLockLeaseLost) {
+			err = fmt.Errorf("%w: %v", ErrLockLeaseLost, err)
+		}
+		return err
+	}
+	return nil
+}
+
+// currentLeaseDuration returns the lease duration the renewal goroutine should
+// request.
+func (h *lockHandle) currentLeaseDuration() time.Duration {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.leaseDuration > 0 {
+		return h.leaseDuration
+	}
+	return lockLeaseDuration
+}
+
+// ensureValid is a safety checkpoint used right before publishing results: for
+// storages with leases it actively renews the lease, so a lease that expired
+// without a previously recorded failure is still detected. Non-lease storages
+// always pass, preserving their existing behavior.
+func (h *lockHandle) ensureValid(ctx context.Context) error {
+	if h == nil || !h.leased {
+		return nil
+	}
+	if err := h.Err(); err != nil {
+		return err
+	}
+	return h.renewWith(ctx, h.currentLeaseDuration())
+}
+
+// startLeaseRenewal keeps the handle's lease alive until it is released,
+// renewing it periodically until the handle is released or renewal fails.
+// The initial renewal is performed synchronously by registerLock so that a
+// lease which cannot be renewed at all is known before any protected work runs.
+func (h *lockHandle) startLeaseRenewal() {
+	if !h.leased {
+		return
+	}
+
+	// The renewal goroutine must not inherit cancellation of the operation
+	// context: it lives until release, which always cancels it.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	h.mu.Lock()
+	h.cancel = cancel
+	h.done = done
+	h.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(lockLeaseRenewalPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := h.renewWith(ctx, h.currentLeaseDuration()); err != nil {
+					// The lease is lost (or the handle is being stopped); stop
+					// renewing. The handle remains registered so the deferred
+					// release can still join this goroutine (it will not delete
+					// the successor's lock).
+					return
+				}
+			}
+		}
+	}()
+}
+
+// newLockOwner returns a token that uniquely identifies one lock acquisition.
+// It only needs to be unique among acquisitions this process could confuse with
+// one another; it is never used as a secret.
+func newLockOwner() string {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err == nil {
+		return hex.EncodeToString(token[:])
+	}
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), atomic.AddUint64(&lockOwnerCounter, 1))
+}
+
+func registerLock(ctx context.Context, storage Storage, lockKey string) *lockHandle {
+	_, leased := storage.(LockLeaseRenewer)
+	owner, _ := LockOwnerFromContext(ctx)
+	if owner == "" {
+		owner = newLockOwner()
+	}
+	handle := &lockHandle{
+		storage:       storage,
+		lockKey:       lockKey,
+		owner:         owner,
+		leased:        leased,
+		leaseDuration: lockLeaseDuration,
+	}
+
+	locksMu.Lock()
+	previous := locks[lockKey]
+	locks[lockKey] = handle
+	locksMu.Unlock()
+
+	// If this name had an older acquisition in this process, that acquisition
+	// can no longer be the owner (a second successful acquisition of the same
+	// name means the first was released or its lease was lost). Stop its
+	// renewal goroutine so it cannot attempt to extend a lease that no longer
+	// belongs to it; it is joined so no goroutine is left behind.
+	if previous != nil {
+		previous.stopRenewal()
+	}
+
+	if !leased {
+		return handle
+	}
+
+	// Renew once synchronously so the caller learns immediately (via the
+	// handle) whether the backend still considers this acquisition its own;
+	// the protected flow checks before doing any work. A failure here is not
+	// returned as an acquisition error: the lock was obtained, it just may not
+	// be provably held long enough to use. In that case no renewal goroutine is
+	// started, since the handle is already marked lost.
+	if err := handle.renewWith(ctx, lockLeaseDuration); err == nil {
+		handle.startLeaseRenewal()
+	}
+	return handle
+}
+
+// acquireLock obtains the named lock and registers a handle for it. The owner
+// token is placed on the context before acquisition so storages that can record
+// an owner do so atomically with the acquisition.
+func acquireLock(ctx context.Context, storage Storage, lockKey string) (*lockHandle, error) {
+	ctx = withLockOwner(ctx, newLockOwner())
+	if err := storage.Lock(ctx, lockKey); err != nil {
+		return nil, err
+	}
+	return registerLock(ctx, storage, lockKey), nil
+}
+
+func tryAcquireLock(ctx context.Context, storage Storage, lockKey string) (*lockHandle, bool, error) {
 	locker, ok := storage.(TryLocker)
 	if !ok {
-		return false, fmt.Errorf("%T does not implement TryLocker", storage)
+		return nil, false, fmt.Errorf("%T does not implement TryLocker", storage)
 	}
 
+	ctx = withLockOwner(ctx, newLockOwner())
 	ok, err := locker.TryLock(ctx, lockKey)
-	if ok && err == nil {
-		locksMu.Lock()
-		locks[lockKey] = storage
-		locksMu.Unlock()
+	if !ok || err != nil {
+		return nil, ok, err
 	}
-	return ok, err
+	return registerLock(ctx, storage, lockKey), true, nil
 }
 
-func releaseLock(ctx context.Context, storage Storage, lockKey string) error {
-	err := storage.Unlock(context.WithoutCancel(ctx), lockKey)
+func releaseLock(ctx context.Context, handle *lockHandle) error {
+	if handle == nil {
+		return nil
+	}
+
+	// Stop this handle's renewal before releasing, so a renewal cannot land
+	// after the lock is gone and touch a successor's lock. This also joins the
+	// goroutine, so a finished task leaves none behind.
+	handle.stopRenewal()
+
+	// Storages without lease support keep their historical behavior: Unlock is
+	// always attempted by name.
+	if !handle.leased {
+		err := handle.storage.Unlock(context.WithoutCancel(ctx), handle.lockKey)
+		if err == nil {
+			unregisterLock(handle)
+		}
+		return err
+	}
+
+	// Only the current owner may release a lock. If this handle is no longer
+	// the registered acquisition of the name (it was replaced by a newer one,
+	// or already released), calling Unlock by name could delete a successor's
+	// lock, so leave it alone. (The backend's lease expiry cleans it up.)
+	locksMu.Lock()
+	current, ok := locks[handle.lockKey]
+	locksMu.Unlock()
+	if !ok || current != handle {
+		if handle.Err() != nil {
+			return handle.Err()
+		}
+		return fmt.Errorf("%w: lock %q is no longer held by this worker", ErrLockLeaseLost, handle.lockKey)
+	}
+
+	// If the lease was lost, the backend cannot prove ownership from the name
+	// alone and another worker may hold the lock now; do not delete it.
+	if err := handle.Err(); err != nil {
+		unregisterLock(handle)
+		return err
+	}
+
+	err := handle.storage.Unlock(withLockOwner(context.WithoutCancel(ctx), handle.owner), handle.lockKey)
 	if err == nil {
-		locksMu.Lock()
-		delete(locks, lockKey)
-		locksMu.Unlock()
+		unregisterLock(handle)
 	}
 	return err
 }
 
-// locks stores a reference to all the current
-// locks obtained by this process.
-var locks = make(map[string]Storage)
+// unregisterLock removes handle from the registry if it is still the current
+// acquisition of its lock. It never removes a successor's entry.
+func unregisterLock(handle *lockHandle) {
+	locksMu.Lock()
+	if locks[handle.lockKey] == handle {
+		delete(locks, handle.lockKey)
+	}
+	locksMu.Unlock()
+}
+
+// locks stores the lock handles currently acquired by this process. The owner
+// token in each handle distinguishes separate acquisitions of the same name.
+var locks = make(map[string]*lockHandle)
 var locksMu sync.Mutex
+var lockOwnerCounter uint64
+
+// lockLeaseDuration is the lease duration requested for lock leases, and
+// lockLeaseRenewalPeriod is how often the lease is renewed while the lock is
+// held. Both are variables so tests can use short intervals. Renewing three
+// times per lease leaves room for a retry or two before the lease is
+// considered lost.
+var (
+	lockLeaseDuration      = retryIntervals[0] + DefaultACME.CertObtainTimeout
+	lockLeaseRenewalPeriod = lockLeaseDuration / 3
+)
 
 // StorageKeys provides methods for accessing
 // keys and key prefixes for items in a Storage.

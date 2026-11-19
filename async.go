@@ -206,6 +206,12 @@ func doWithRetry(ctx context.Context, log *zap.Logger, f func(context.Context) e
 			if errors.As(err, &errNoRetry) {
 				return err
 			}
+			// A lost lock lease is not a transient CA/storage failure: the
+			// handle cannot be made valid again by waiting, and another worker
+			// may already own the lock, so retrying would only contend with it.
+			if errors.Is(err, ErrLockLeaseLost) {
+				return err
+			}
 			if intervalIndex < len(retryIntervals)-1 {
 				intervalIndex++
 			}
