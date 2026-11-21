@@ -574,7 +574,18 @@ func (cfg *Config) manageOne(ctx context.Context, domainName string, async bool)
 	}
 
 	if async {
-		jm.Submit(cfg.Logger, "renew_"+domainName, renew)
+		// Route through the cache's renewal scheduler under the same key
+		// ("renew_"+name) used by the periodic maintenance loop, so an
+		// on-demand renewal and a maintenance-driven renewal of the same
+		// logical identity coalesce into one job instead of running twice.
+		// The obtain path above intentionally stays on the package-level
+		// jm with an empty name: duplicate obtains must remain allowed
+		// across config reloads (see the comment there).
+		if err := cfg.certCache.getRenewalScheduler().Submit(ctx, cfg.Logger, "renew_"+domainName, cert.issuerKey, func(context.Context) error {
+			return renew()
+		}); err != nil {
+			return err
+		}
 		return nil
 	}
 	return renew()

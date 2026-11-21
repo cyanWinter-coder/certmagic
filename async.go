@@ -148,6 +148,17 @@ func (rb *renewalBackoff) readyForAsOf(name string, asOf time.Time) bool {
 // immediately rather than being throttled forever; if the certificate still
 // needs renewal by then, a fresh backoff cycle begins.
 func (rb *renewalBackoff) recordFailure(name string, now time.Time) (exhausted bool) {
+	return rb.recordFailureWithRetryAfter(name, now, time.Time{})
+}
+
+// recordFailureWithRetryAfter is recordFailure with an optional
+// server-announced retry time. When retryAfter is set, the scheduled attempt
+// waits until at least that time (the server's instruction takes precedence
+// over the local exponential backoff), but never longer than
+// maxRenewalRetryWait so a bad or misparsed server value cannot park the
+// renewal indefinitely. A retry time in the past simply yields the normal
+// interval-based backoff.
+func (rb *renewalBackoff) recordFailureWithRetryAfter(name string, now, retryAfter time.Time) (exhausted bool) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 	if rb.state == nil {
@@ -165,7 +176,17 @@ func (rb *renewalBackoff) recordFailure(name string, now time.Time) (exhausted b
 	if st.intervalIdx < len(retryIntervals)-1 {
 		st.intervalIdx++
 	}
-	st.nextAttempt = now.Add(retryIntervals[st.intervalIdx])
+	wait := retryIntervals[st.intervalIdx]
+	if !retryAfter.IsZero() {
+		serverWait := retryAfter.Sub(now)
+		if serverWait > wait {
+			if serverWait > maxRenewalRetryWait {
+				serverWait = maxRenewalRetryWait
+			}
+			wait = serverWait
+		}
+	}
+	st.nextAttempt = now.Add(wait)
 	return false
 }
 

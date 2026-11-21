@@ -66,6 +66,12 @@ type Cache struct {
 	// Used to signal when stopping is completed
 	doneChan chan struct{}
 
+	// renewalScheduler paces and bounds concurrency of background renewal
+	// jobs. It is created lazily (see getRenewalScheduler) so that Cache
+	// values built as struct literals in tests keep working.
+	renewalScheduler   *renewalScheduler
+	renewalSchedulerMu sync.Mutex
+
 	logger *zap.Logger
 }
 
@@ -107,9 +113,44 @@ func NewCache(opts CacheOptions) *Cache {
 
 	c.SetOptions(opts)
 
+	// start the renewal scheduler with the configured concurrency limits
+	c.renewalScheduler = c.newRenewalSchedulerFromOptions()
+
 	go c.maintainAssets(0)
 
 	return c
+}
+
+// newRenewalSchedulerFromOptions builds the renewal scheduler from the
+// currently configured cache options. Negative limits are treated as
+// unlimited (zero), matching the documented meaning of a zero limit.
+func (certCache *Cache) newRenewalSchedulerFromOptions() *renewalScheduler {
+	certCache.optionsMu.RLock()
+	opts := certCache.options
+	certCache.optionsMu.RUnlock()
+
+	global := opts.RenewalMaxConcurrency
+	if global < 0 {
+		global = 0
+	}
+	perIssuer := opts.RenewalMaxConcurrencyPerIssuer
+	if perIssuer < 0 {
+		perIssuer = 0
+	}
+	return newRenewalScheduler(global, perIssuer, opts.RenewalIssuerConcurrency)
+}
+
+// getRenewalScheduler returns the cache's renewal scheduler, starting one
+// lazily with the current options if none exists yet. This keeps Cache
+// values constructed as struct literals (including in tests) working without
+// requiring NewCache.
+func (certCache *Cache) getRenewalScheduler() *renewalScheduler {
+	certCache.renewalSchedulerMu.Lock()
+	defer certCache.renewalSchedulerMu.Unlock()
+	if certCache.renewalScheduler == nil {
+		certCache.renewalScheduler = certCache.newRenewalSchedulerFromOptions()
+	}
+	return certCache.renewalScheduler
 }
 
 func (certCache *Cache) SetOptions(opts CacheOptions) {
@@ -143,6 +184,17 @@ func (certCache *Cache) SetOptions(opts CacheOptions) {
 func (certCache *Cache) Stop() {
 	close(certCache.stopChan) // signal to stop
 	<-certCache.doneChan      // wait for stop to complete
+
+	// Shut down the renewal scheduler and wait for any in-flight renewal
+	// goroutines it spawned to exit, so no background goroutine outlives
+	// the cache. A lazily-created cache (e.g. a test struct literal that
+	// never scheduled a renewal) may have no scheduler at all.
+	certCache.renewalSchedulerMu.Lock()
+	rs := certCache.renewalScheduler
+	certCache.renewalSchedulerMu.Unlock()
+	if rs != nil {
+		rs.Stop()
+	}
 }
 
 // CacheOptions is used to configure certificate caches.
@@ -180,6 +232,33 @@ type CacheOptions struct {
 	// If reached, certificates will be randomly evicted to
 	// make room for new ones. 0 means unlimited.
 	Capacity int
+
+	// RenewalMaxConcurrency bounds how many renewal jobs may
+	// run at the same time across all issuers combined. This
+	// caps the total load (ACME transactions, challenges, and
+	// origin traffic) a restart that finds many certificates
+	// expiring at once can generate. A value of 0 means
+	// unlimited, which is the default and preserves the
+	// historical behavior of running every queued renewal
+	// immediately.
+	RenewalMaxConcurrency int
+
+	// RenewalMaxConcurrencyPerIssuer bounds how many renewal
+	// jobs for a single issuer may run at the same time. It
+	// keeps one issuer -- for example one whose endpoint is
+	// failing or rate-limiting -- from consuming the whole
+	// global budget and stalling renewals at the other
+	// issuers. Per-issuer overrides may be set in
+	// RenewalIssuerConcurrency. A value of 0 means unlimited,
+	// which is the default.
+	RenewalMaxConcurrencyPerIssuer int
+
+	// RenewalIssuerConcurrency optionally overrides the
+	// per-issuer concurrency limit for individual issuer
+	// keys; issuers absent from the map use
+	// RenewalMaxConcurrencyPerIssuer. A limit of 0 for an
+	// issuer means unlimited for that issuer. May be nil.
+	RenewalIssuerConcurrency map[string]int
 
 	// Set a logger to enable logging
 	Logger *zap.Logger
