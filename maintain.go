@@ -16,15 +16,11 @@ package certmagic
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/fs"
-	"path"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/mholt/acmez/v3/acme"
@@ -803,19 +799,42 @@ func deleteOldOCSPStaples(ctx context.Context, storage Storage, logger *zap.Logg
 }
 
 func deleteExpiredCerts(ctx context.Context, storage Storage, logger *zap.Logger, gracePeriod time.Duration) error {
+	// scan the stored certificates in a bounded, consistent way, so that
+	// corrupt entries and concurrent writes/deletes by other instances
+	// don't abort or corrupt the cleaning of everything else
+	err := ScanStoredCertificates(ctx, storage, CertScanOptions{Logger: logger}, func(scanned ScannedCertificate) error {
+		if expiredTime := time.Since(expiresAt(scanned.Certificate)); expiredTime >= gracePeriod {
+			logger.Info("certificate expired beyond grace period; cleaning up",
+				zap.String("asset_key", scanned.CertKey),
+				zap.Duration("expired_for", expiredTime),
+				zap.Duration("grace_period", gracePeriod))
+			for _, relatedAsset := range scanned.AssetKeys() {
+				logger.Info("deleting asset because resource expired", zap.String("asset_key", relatedAsset))
+				err := storage.Delete(ctx, relatedAsset)
+				if err != nil {
+					logger.Error("could not clean up asset related to expired certificate",
+						zap.String("related_asset", relatedAsset),
+						zap.Error(err))
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// update listings; if a site folder is empty now, delete it
 	issuerKeys, err := storage.List(ctx, prefixCerts, false)
 	if err != nil {
 		// maybe just hasn't been created yet; no big deal
 		return nil
 	}
-
 	for _, issuerKey := range issuerKeys {
 		siteKeys, err := storage.List(ctx, issuerKey, false)
 		if err != nil {
-			logger.Error("listing contents", zap.String("issuer_key", issuerKey), zap.Error(err))
 			continue
 		}
-
 		for _, siteKey := range siteKeys {
 			// if context was cancelled, quit early; otherwise proceed
 			select {
@@ -825,54 +844,6 @@ func deleteExpiredCerts(ctx context.Context, storage Storage, logger *zap.Logger
 			}
 
 			siteAssets, err := storage.List(ctx, siteKey, false)
-			if err != nil {
-				logger.Error("listing site contents", zap.String("site_key", siteKey), zap.Error(err))
-				continue
-			}
-
-			for _, assetKey := range siteAssets {
-				if path.Ext(assetKey) != ".crt" {
-					continue
-				}
-
-				certFile, err := storage.Load(ctx, assetKey)
-				if err != nil {
-					return fmt.Errorf("loading certificate file %s: %v", assetKey, err)
-				}
-				block, _ := pem.Decode(certFile)
-				if block == nil || block.Type != "CERTIFICATE" {
-					return fmt.Errorf("certificate file %s does not contain PEM-encoded certificate", assetKey)
-				}
-				cert, err := x509.ParseCertificate(block.Bytes)
-				if err != nil {
-					return fmt.Errorf("certificate file %s is malformed; error parsing PEM: %v", assetKey, err)
-				}
-
-				if expiredTime := time.Since(expiresAt(cert)); expiredTime >= gracePeriod {
-					logger.Info("certificate expired beyond grace period; cleaning up",
-						zap.String("asset_key", assetKey),
-						zap.Duration("expired_for", expiredTime),
-						zap.Duration("grace_period", gracePeriod))
-					baseName := strings.TrimSuffix(assetKey, ".crt")
-					for _, relatedAsset := range []string{
-						assetKey,
-						baseName + ".key",
-						baseName + ".json",
-					} {
-						logger.Info("deleting asset because resource expired", zap.String("asset_key", relatedAsset))
-						err := storage.Delete(ctx, relatedAsset)
-						if err != nil {
-							logger.Error("could not clean up asset related to expired certificate",
-								zap.String("base_name", baseName),
-								zap.String("related_asset", relatedAsset),
-								zap.Error(err))
-						}
-					}
-				}
-			}
-
-			// update listing; if folder is empty, delete it
-			siteAssets, err = storage.List(ctx, siteKey, false)
 			if err != nil {
 				continue
 			}
