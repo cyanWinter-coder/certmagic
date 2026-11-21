@@ -233,7 +233,10 @@ func (certCache *Cache) queueRenewalTask(ctx context.Context, oldCert Certificat
 	// we only support managing certificates with one name per cert,
 	// so this should be easy.
 	renewName := oldCert.Names[0]
-	jobName := "renew_" + renewName
+	// Canonicalize (case, trailing dot, IDNA) so equivalent spellings of
+	// the same domain share the jobManager's dedup slot and the backoff
+	// schedule instead of being tracked as unrelated certificates.
+	jobName := "renew_" + issuanceKey(renewName)
 
 	// If a previous attempt for this name failed, don't try again until the
 	// backoff schedule (the same retryIntervals used by doWithRetry) says

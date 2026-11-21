@@ -228,6 +228,15 @@ type Config struct {
 
 	// required pointer to the in-memory cert cache
 	certCache *Cache
+
+	// Test seams: when non-nil, the on-demand issuance path calls these
+	// instead of the real storage/ACME-backed operations. They are
+	// unexported so they exist only for in-package lifecycle tests and
+	// never appear in the public API surface.
+	obtainCertForTest func(ctx context.Context, name string) error
+	loadCertForTest   func(ctx context.Context, name string) (Certificate, error)
+	renewCertForTest  func(ctx context.Context, name string) error
+	reloadCertForTest func(ctx context.Context, old Certificate) (Certificate, error)
 }
 
 // NewDefault makes a valid config based on the package
@@ -574,7 +583,7 @@ func (cfg *Config) manageOne(ctx context.Context, domainName string, async bool)
 	}
 
 	if async {
-		jm.Submit(cfg.Logger, "renew_"+domainName, renew)
+		jm.Submit(cfg.Logger, "renew_"+issuanceKey(domainName), renew)
 		return nil
 	}
 	return renew()
