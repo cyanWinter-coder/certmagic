@@ -165,11 +165,11 @@ func TestGetCertDuringHandshakeWaiterErrorPropagation(t *testing.T) {
 		results <- err
 	}()
 
-	// wait until the leader has registered itself in the wait queue
+	// wait until the leader has registered itself in the application registry
 	for {
-		certLoadWaitChansMu.Lock()
-		_, registered := certLoadWaitChans[serverName]
-		certLoadWaitChansMu.Unlock()
+		certApplications.mu.Lock()
+		_, registered := certApplications.applications[serverName]
+		certApplications.mu.Unlock()
 		if registered {
 			break
 		}

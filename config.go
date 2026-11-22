@@ -452,7 +452,13 @@ func (cfg *Config) manageAll(ctx context.Context, domainNames []string, async bo
 	}
 
 	for _, domainName := range domainNames {
-		domainName = normalizedName(domainName)
+		// fold case, trailing dots and IDNs the same way the handshake
+		// path does, so allowlist lookups use the identical identity key
+		if canonical, err := canonicalName(domainName); err == nil {
+			domainName = canonical
+		} else {
+			domainName = normalizedName(domainName)
+		}
 
 		// if on-demand is configured, defer obtain and renew operations
 		if cfg.OnDemand != nil {

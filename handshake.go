@@ -116,7 +116,15 @@ func (cfg *Config) GetCertificateWithContext(ctx context.Context, clientHello *t
 //
 // This function is safe for concurrent use.
 func (cfg *Config) getCertificateFromCache(hello *tls.ClientHelloInfo) (cert Certificate, matched, defaulted bool) {
-	name := normalizedName(hello.ServerName)
+	// Use the same normalization (case, trailing dot, IDNA) as the
+	// obtain/load lifecycle so equivalent SNI values hit the same cache
+	// index entry instead of starting a second application. Fall back to
+	// plain lower-casing if IDNA rejects the input; the obtain path will
+	// surface the actual validation error.
+	name, err := canonicalName(hello.ServerName)
+	if err != nil {
+		name = normalizedName(hello.ServerName)
+	}
 
 	if name == "" {
 		// if SNI is empty, prefer matching IP address
@@ -130,7 +138,7 @@ func (cfg *Config) getCertificateFromCache(hello *tls.ClientHelloInfo) (cert Cer
 
 		// use a "default" certificate by name, if specified
 		if cfg.DefaultServerName != "" {
-			normDefault := normalizedName(cfg.DefaultServerName)
+			normDefault, _ := canonicalName(cfg.DefaultServerName)
 			cert, defaulted = cfg.selectCert(hello, normDefault)
 			if defaulted {
 				return
@@ -163,7 +171,7 @@ func (cfg *Config) getCertificateFromCache(hello *tls.ClientHelloInfo) (cert Cer
 	// downstream ServerName in the handshake but accept
 	// the backend origin's true hostname in a cert).
 	if cfg.FallbackServerName != "" {
-		normFallback := normalizedName(cfg.FallbackServerName)
+		normFallback, _ := canonicalName(cfg.FallbackServerName)
 		cert, defaulted = cfg.selectCert(hello, normFallback)
 		if defaulted {
 			return
@@ -299,69 +307,50 @@ func (cfg *Config) getCertDuringHandshake(ctx context.Context, hello *tls.Client
 	}
 
 	// By this point, we need to load or obtain a certificate. If a swarm of requests comes in for the same
-	// domain, avoid pounding manager or storage thousands of times simultaneously. We use a similar sync
-	// strategy for obtaining certificate during handshake.
-	certLoadWaitChansMu.Lock()
-	waiter, ok := certLoadWaitChans[name]
-	if ok {
-		// another goroutine is already loading the cert; just wait
-		certLoadWaitChansMu.Unlock()
-
-		timeout := time.NewTimer(2 * time.Minute)
-		select {
-		case <-timeout.C:
-			return Certificate{}, fmt.Errorf("timed out waiting to load certificate for %s", name)
-		case <-ctx.Done():
-			timeout.Stop()
-			return Certificate{}, ctx.Err()
-		case <-waiter.done:
-			timeout.Stop()
+	// domain, avoid pounding manager or storage thousands of times simultaneously: every handshake for the
+	// same canonical identity joins one shared on-demand application instead of starting its own.
+	app, isLeader := certApplications.join(name)
+	if !isLeader {
+		// another goroutine is already loading/obtaining the cert; wait for its
+		// terminal outcome. Our own cancellation (client disconnect) makes us
+		// stop waiting but does not disturb the shared application.
+		cert, err := app.await(ctx, name)
+		if err != nil {
+			return Certificate{}, err
 		}
-
-		// Use the leader's outcome directly; fall back to the recursive
-		// cache lookup only if it finished with neither a cert nor an
-		// error.
-		if !waiter.cert.Empty() || waiter.err != nil {
-			return waiter.cert, waiter.err
+		if !cert.Empty() {
+			return cert, nil
 		}
-
+		// the leader finished with neither a cert nor an error; fall back to a
+		// non-loading cache/default resolution below.
 		return cfg.getCertDuringHandshake(ctx, hello, false)
 	}
 
-	// no other goroutine is currently trying to load this cert
-	waiter = &certLoadWaiter{done: make(chan struct{})}
-	certLoadWaitChans[name] = waiter
-	certLoadWaitChansMu.Unlock()
+	// We are the leader: the application runs on a context detached from any
+	// one handshake, so a disconnecting first waiter cannot cancel work the
+	// other waiters still rely on.
+	leaderCtx, cancelLeader := leaderContext(ctx)
+	defer cancelLeader()
 
-	// unblock others and clean up when we're done
+	// publish the terminal outcome to all waiters and release the slot once
+	// we're done, so the next explicit request can start fresh on failure
 	defer func() {
-		certLoadWaitChansMu.Lock()
-		// Propagate our outcome to waiters so they don't recursively
-		// re-enter the wait queue and pile up; don't overwrite a result
-		// already set by the external-manager path.
-		if waiter.cert.Empty() && waiter.err == nil {
-			waiter.cert, waiter.err = retCert, retErr
-		}
-		close(waiter.done)
-		delete(certLoadWaitChans, name)
-		certLoadWaitChansMu.Unlock()
+		certApplications.finish(name, app, retCert, retErr)
 	}()
 
 	// If an external Manager is configured, try to get it from them.
 	// Only continue to use our own logic if it returns empty+nil.
-	externalCert, err := cfg.getCertFromAnyCertManager(ctx, hello, logger)
+	externalCert, err := cfg.getCertFromAnyCertManager(leaderCtx, hello, logger)
 	if err != nil {
-		waiter.err = err
 		return Certificate{}, err
 	}
 	if !externalCert.Empty() {
-		waiter.cert = externalCert
 		return externalCert, nil
 	}
 
 	// Make sure a certificate is allowed for the given name. If not, it doesn't make sense
 	// to try loading one from storage (issue #185) or obtaining one from an issuer.
-	if err := cfg.checkIfCertShouldBeObtained(ctx, name, false); err != nil {
+	if err := cfg.checkIfCertShouldBeObtained(leaderCtx, name, false); err != nil {
 		return Certificate{}, fmt.Errorf("certificate is not allowed for server name %s: %w", name, err)
 	}
 
@@ -387,7 +376,7 @@ func (cfg *Config) getCertDuringHandshake(ctx context.Context, hello *tls.Client
 
 	if loadDynamically && loadOrObtainIfNecessary {
 		// Check to see if we have one on disk
-		loadedCert, err := cfg.loadCertFromStorage(ctx, logger, hello)
+		loadedCert, err := cfg.loadCertFromStorage(leaderCtx, logger, hello)
 		if err == nil {
 			return loadedCert, nil
 		}
@@ -396,7 +385,7 @@ func (cfg *Config) getCertDuringHandshake(ctx context.Context, hello *tls.Client
 			zap.Error(err))
 		if cfg.OnDemand != nil {
 			// By this point, we need to ask the CA for a certificate
-			return cfg.obtainOnDemandCertificate(ctx, hello)
+			return cfg.obtainOnDemandCertificate(leaderCtx, hello)
 		}
 		return loadedCert, nil
 	}
@@ -555,18 +544,20 @@ func (cfg *Config) obtainOnDemandCertificate(ctx context.Context, hello *tls.Cli
 
 	log.Info("obtaining new certificate", zap.String("server_name", name))
 
-	// set a timeout so we don't inadvertently hold a client handshake open too long
-	// (timeout duration is based on https://caddy.community/t/zerossl-dns-challenge-failing-often-route53-plugin/13822/24?u=matt)
-	var cancel context.CancelFunc
-	ctx, cancel = context.WithTimeout(ctx, 180*time.Second)
-	defer cancel()
+	// The caller (the shared on-demand application leader) already supplied a
+	// context that is detached from the triggering handshakes and bounded by
+	// onDemandObtainTimeout, so don't re-wrap it here: doing so would tie the
+	// issuance's lifetime back to a single client's connection.
 
 	// obtain the certificate (this puts it in storage) and if successful,
 	// load it from storage so we and any other waiting goroutine can use it
 	var cert Certificate
 	err = cfg.ObtainCertAsync(ctx, name)
 	if err == nil {
-		// load from storage while others wait to make the op as atomic as possible
+		// load from storage while others wait to make the op as atomic as possible:
+		// the certificate only becomes visible through the cache once it is fully
+		// assembled, and this returns before the application slot is released, so
+		// every waiter reads the same terminal certificate
 		cert, err = cfg.loadCertFromStorage(ctx, log, hello)
 		if err != nil {
 			log.Error("loading newly-obtained certificate from storage", zap.String("server_name", name), zap.Error(err))
@@ -905,7 +896,7 @@ func (cfg *Config) getNameFromClientHello(hello *tls.ClientHelloInfo) (string, e
 	// (see https://unicode.org/faq/idn.html#22) where not all normalizations are 1:1.
 	// The Lookup profile, for instance, rejects wildcard characters (*), but they
 	// should never be used in the ClientHello SNI anyway.
-	name, err := idna.Lookup.ToASCII(strings.TrimSpace(hello.ServerName))
+	name, err := canonicalName(hello.ServerName)
 	if err != nil {
 		return "", err
 	}
@@ -913,7 +904,7 @@ func (cfg *Config) getNameFromClientHello(hello *tls.ClientHelloInfo) (string, e
 		return name, nil
 	}
 	if cfg.DefaultServerName != "" {
-		return normalizedName(cfg.DefaultServerName), nil
+		return canonicalName(cfg.DefaultServerName)
 	}
 	return localIPFromConn(hello.Conn), nil
 }
@@ -959,26 +950,40 @@ func normalizedName(serverName string) string {
 	return strings.ToLower(strings.TrimSpace(serverName))
 }
 
-// obtainCertWaitChans is used to coordinate obtaining certs for each hostname.
+// canonicalName is the single normalization rule for every identity that
+// flows through the on-demand certificate lifecycle (wait-queue keys,
+// cache index keys, storage paths and ACME identifiers). It folds together
+// the three representations clients actually send so that one identity
+// shares one application slot:
+//
+//   - surrounding whitespace is trimmed
+//   - the optional DNS root label (one or more trailing dots) is removed,
+//     since "example.com" and "example.com." denote the same host
+//   - upper-case letters are folded to lower case
+//   - IDNs are encoded to ASCII (punycode) per the IDNA Lookup profile,
+//     so a Unicode SNI and its punycode form converge on one key
+//
+// If IDNA processing rejects the input, the lower-cased, trimmed form is
+// returned alongside the error so the caller can still make a decision
+// (typically a SubjectQualifiesForCert denial) rather than crashing.
+func canonicalName(serverName string) (string, error) {
+	trimmed := strings.TrimSpace(serverName)
+	// strip the optional DNS root label (one or more trailing dots)
+	trimmed = strings.TrimRight(trimmed, ".")
+	ascii, err := idna.Lookup.ToASCII(trimmed)
+	if err != nil {
+		return strings.ToLower(trimmed), err
+	}
+	return ascii, nil
+}
+
+// obtainCertWaitChans coordinates in-flight on-demand renewals (and obtains
+// reached through the renewal path) for each hostname. The initial load/obtain
+// of an uncached name is coordinated separately by certApplications in
+// ondemand.go, which also detaches the work from individual handshakes.
 var (
 	obtainCertWaitChans   = make(map[string]chan struct{})
 	obtainCertWaitChansMu sync.Mutex
-)
-
-// certLoadWaiter coordinates concurrent certificate loading for the same name.
-// The leader populates the result and closes the channel; waiters read the result
-// after the channel is closed. This allows externally-managed certificates (which
-// are not cached) to be shared directly with waiting goroutines.
-type certLoadWaiter struct {
-	done chan struct{}
-	cert Certificate
-	err  error
-}
-
-// TODO: this lockset should probably be per-cache
-var (
-	certLoadWaitChans   = make(map[string]*certLoadWaiter)
-	certLoadWaitChansMu sync.Mutex
 )
 
 type serializableClientHello struct {
