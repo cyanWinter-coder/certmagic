@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"sync"
 
 	"go.uber.org/zap"
 )
@@ -38,6 +39,25 @@ func (cfg *Config) groundTruthStorage() Storage {
 	return cfg.certStorage(false)
 }
 
+// localGenerationCache returns the generation-coordinated cache wrapping
+// cfg.LocalCache, creating it once. The coordinator's state lives in the
+// LocalCache itself, so even a coordinator recreated after a restart picks up
+// the persisted index and keeps generations monotonic.
+func (cfg *Config) localGenerationCache() *generationCache {
+	if cfg.localCacheMu == nil {
+		// Configs can be constructed without New and are occasionally copied by
+		// value, so the guard is a lazily allocated pointer rather than an
+		// embedded mutex
+		cfg.localCacheMu = &sync.Mutex{}
+	}
+	cfg.localCacheMu.Lock()
+	defer cfg.localCacheMu.Unlock()
+	if cfg.localGenCache == nil {
+		cfg.localGenCache = newGenerationCache(cfg.LocalCache, cfg.Logger)
+	}
+	return cfg.localGenCache
+}
+
 // certStorage returns the Storage to use for a certificate's assets: its
 // certificate, private key, and metadata files, and its OCSP staple. If a
 // LocalCache is configured, the returned Storage keeps it up to date with
@@ -49,7 +69,7 @@ func (cfg *Config) certStorage(readLocal bool) Storage {
 	}
 	return localCacheStorage{
 		Storage:   cfg.Storage,
-		local:     cfg.LocalCache,
+		local:     cfg.localGenerationCache(),
 		readLocal: readLocal,
 		logger:    cfg.Logger,
 	}
@@ -73,7 +93,7 @@ var errUnusableCert = errors.New("unusable certificate")
 // than returned.
 type localCacheStorage struct {
 	Storage
-	local     Storage
+	local     *generationCache
 	readLocal bool
 	logger    *zap.Logger
 }
@@ -94,16 +114,44 @@ func (ls localCacheStorage) Load(ctx context.Context, key string) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
-	ls.cacheLocally(ctx, key, value)
+	// refresh under the key's coordination: a slow read carrying the old
+	// certificate cannot overwrite the renewed one a faster read committed
+	if _, refreshErr := ls.local.Refresh(ctx, key, func() ([]byte, error) {
+		return value, nil
+	}); refreshErr != nil {
+		ls.logger.Warn("refreshing local cache",
+			zap.String("key", key),
+			zap.Error(refreshErr))
+	}
 	return value, nil
 }
 
 func (ls localCacheStorage) Store(ctx context.Context, key string, value []byte) error {
 	err := ls.Storage.Store(ctx, key, value)
 	if err != nil {
+		// the authoritative write failed; leave the previous local version in
+		// place so a restart can still reload what Storage actually holds
 		return err
 	}
 	ls.cacheLocally(ctx, key, value)
+	return nil
+}
+
+// StoreTx writes the whole batch to the authoritative Storage first and only
+// then to the local cache, where the generation coordinator commits all files
+// under one generation. If either side fails, the previously cached version
+// stays readable; the original Storage error is returned verbatim.
+func (ls localCacheStorage) StoreTx(ctx context.Context, all []keyValue) error {
+	// call storeTx on the embedded authoritative Storage directly, not on ls,
+	// or the txStorage assertion would loop back into this method
+	err := storeTx(ctx, ls.Storage, all)
+	if err != nil {
+		return err
+	}
+	if localErr := ls.local.StoreTx(ctx, all); localErr != nil && !errors.Is(localErr, errStaleGeneration) {
+		ls.logger.Warn("storing batch in local cache",
+			zap.Error(localErr))
+	}
 	return nil
 }
 
@@ -113,7 +161,7 @@ func (ls localCacheStorage) Store(ctx context.Context, key string, value []byte)
 func (ls localCacheStorage) Delete(ctx context.Context, key string) error {
 	err := ls.Storage.Delete(ctx, key)
 	localErr := ls.local.Delete(ctx, key)
-	if localErr != nil && !errors.Is(localErr, fs.ErrNotExist) {
+	if localErr != nil && !errors.Is(localErr, fs.ErrNotExist) && !errors.Is(localErr, errStaleGeneration) {
 		ls.logger.Warn("deleting from local cache",
 			zap.String("key", key),
 			zap.Error(localErr))
@@ -123,7 +171,7 @@ func (ls localCacheStorage) Delete(ctx context.Context, key string) error {
 
 func (ls localCacheStorage) cacheLocally(ctx context.Context, key string, value []byte) {
 	err := ls.local.Store(ctx, key, value)
-	if err != nil {
+	if err != nil && !errors.Is(err, errStaleGeneration) {
 		ls.logger.Warn("storing in local cache",
 			zap.String("key", key),
 			zap.Error(err))

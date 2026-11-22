@@ -193,8 +193,22 @@ type KeyInfo struct {
 	IsTerminal bool // false for directories (keys that act as prefix for other keys)
 }
 
-// storeTx stores all the values or none at all.
+// txStorage is an optional Storage capability: StoreTx commits all values
+// (or, on failure, none of them) as one coordinated change. It lets a local
+// cache advance the files of one certificate under a single generation, so a
+// reader cannot see part of the old version and part of the new one.
+type txStorage interface {
+	StoreTx(ctx context.Context, all []keyValue) error
+}
+
+// storeTx stores all the values or none at all. Storages implementing txStorage
+// get the whole batch in one call so they can commit it atomically; others
+// fall back to storing the values in order and rolling back what was written
+// if a later value fails.
 func storeTx(ctx context.Context, s Storage, all []keyValue) error {
+	if txs, ok := s.(txStorage); ok {
+		return txs.StoreTx(ctx, all)
+	}
 	for i, kv := range all {
 		err := s.Store(ctx, kv.key, kv.value)
 		if err != nil {

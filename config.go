@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mholt/acmez/v3"
@@ -185,13 +186,19 @@ type Config struct {
 	// Writes and deletions go to Storage first, then to the local
 	// cache. Since it is only a cache, it may be cleared at any time.
 	//
-	// A certificate's files are not written atomically as a group,
-	// so a write that fails partway through can leave the local
-	// cache with a renewed certificate beside the key it replaced.
-	// A certificate the local cache cannot supply a usable pair for
-	// is reloaded from Storage, which replaces the local copies.
-	// So is one that is due for renewal, since the local cache does
-	// not learn of renewals done by other instances.
+	// The local cache is coordinated per certificate site with a
+	// persisted index of monotonically increasing generations, each
+	// entry carrying the identity (a hash) of its content. A write
+	// that arrives carrying an older generation than the one already
+	// committed is discarded, so a slow instance cannot overwrite a
+	// newer certificate with the version it had in flight. The files
+	// of one site advance together: content is written before the
+	// index points at it, and invalidation or deletion tombstones the
+	// index before recycling the content. A reader therefore sees
+	// either the previous complete version or the new one, never a
+	// mixture, and a write that fails leaves the previous version
+	// readable. Coordination is per key, so work on one domain never
+	// blocks another.
 	//
 	// Beware that this stores private keys on every instance that
 	// serves them, so the local cache should be at least as secure
@@ -199,6 +206,12 @@ type Config struct {
 	//
 	// EXPERIMENTAL: Subject to change or removal.
 	LocalCache Storage
+
+	// localGenCache is the generation-coordinated wrapper around LocalCache,
+	// created lazily by localGenerationCache. It is not part of the public
+	// API and never serialized. The pointer keeps Config safely copyable.
+	localGenCache *generationCache
+	localCacheMu  *sync.Mutex
 
 	// CertMagic will verify the storage configuration
 	// is acceptable before obtaining a certificate
