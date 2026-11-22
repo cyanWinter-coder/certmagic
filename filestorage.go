@@ -15,6 +15,7 @@
 package certmagic
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -76,9 +77,20 @@ func (s *FileStorage) Exists(_ context.Context, key string) bool {
 	return !errors.Is(err, fs.ErrNotExist)
 }
 
-// Store saves value at key.
+// Store saves value at key. The write is atomic: the value is written
+// to a temporary file on the same volume, synced, verified, and only
+// then renamed over the destination, so concurrent readers only ever
+// open the previous complete version or the new complete version, and
+// a crash mid-write leaves the previous version intact. Storing the
+// same value again is a no-op, so repeated publishes are idempotent.
 func (s *FileStorage) Store(_ context.Context, key string, value []byte) error {
 	filename := s.Filename(key)
+	// if the key already holds exactly this value, there is nothing to
+	// do; this keeps repeated publishes idempotent and avoids churning
+	// the file's modification time
+	if existing, err := os.ReadFile(filename); err == nil && bytes.Equal(existing, value) {
+		return nil
+	}
 	err := os.MkdirAll(filepath.Dir(filename), 0700)
 	if err != nil {
 		return err
@@ -93,7 +105,7 @@ func (s *FileStorage) Store(_ context.Context, key string, value []byte) error {
 		fp.Cancel()
 		return err
 	}
-	// close, thereby flushing the write
+	// close, thereby syncing, verifying, and publishing the write
 	return fp.Close()
 }
 

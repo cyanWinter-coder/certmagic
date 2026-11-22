@@ -16,7 +16,9 @@ package certmagic
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"path"
 	"regexp"
 	"strings"
@@ -193,13 +195,52 @@ type KeyInfo struct {
 	IsTerminal bool // false for directories (keys that act as prefix for other keys)
 }
 
-// storeTx stores all the values or none at all.
+// storeTx stores all the values or none at all. The keys in all are
+// treated as one logical object (e.g. a certificate's private key,
+// certificate, and metadata files): if any store fails, the keys
+// written so far are rolled back to their previous values, so a failed
+// transaction never destroys the last complete version of the object.
+// Keys that did not exist before the transaction are removed on
+// rollback.
+//
+// Callers should order all so that the key acting as the commit record
+// (e.g. the certificate metadata file) is stored last; readers that
+// observe the final key can then rely on the preceding keys being
+// complete.
 func storeTx(ctx context.Context, s Storage, all []keyValue) error {
+	// snapshot the current values up front, so a failed transaction
+	// can restore the previous complete version of the object
+	previous := make([][]byte, len(all))
+	existed := make([]bool, len(all))
+	for i, kv := range all {
+		val, err := s.Load(ctx, kv.key)
+		switch {
+		case err == nil:
+			previous[i] = val
+			existed[i] = true
+		case errors.Is(err, fs.ErrNotExist):
+			// key does not exist yet; rollback will delete it
+		default:
+			return fmt.Errorf("snapshotting key %s before transaction: %w", kv.key, err)
+		}
+	}
+
 	for i, kv := range all {
 		err := s.Store(ctx, kv.key, kv.value)
 		if err != nil {
+			// roll back the keys already written, restoring the
+			// previous complete version of the object (best-effort)
 			for j := i - 1; j >= 0; j-- {
-				s.Delete(ctx, all[j].key)
+				var rerr error
+				if existed[j] {
+					rerr = s.Store(ctx, all[j].key, previous[j])
+				} else {
+					rerr = s.Delete(ctx, all[j].key)
+				}
+				if rerr != nil {
+					defaultLogger.Error("rolling back failed storage transaction",
+						zap.String("key", all[j].key), zap.Error(rerr))
+				}
 			}
 			return err
 		}

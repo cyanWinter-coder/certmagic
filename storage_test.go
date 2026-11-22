@@ -15,6 +15,8 @@
 package certmagic
 
 import (
+	"context"
+	"errors"
 	"path"
 	"testing"
 )
@@ -73,6 +75,104 @@ func TestPrefixAndKeyBuilders(t *testing.T) {
 		}
 		if actual := StorageKeys.SiteMeta(am.IssuerKey(), testcase.in); actual != testcase.metaFile {
 			t.Errorf("Test %d: site meta file: Expected '%s' but got '%s'", i, testcase.metaFile, actual)
+		}
+	}
+}
+
+// failOnStore wraps a Storage and fails Store calls for the given key,
+// to exercise storeTx rollback.
+type failOnStore struct {
+	Storage
+	failKey string
+}
+
+func (f *failOnStore) Store(ctx context.Context, key string, value []byte) error {
+	if key == f.failKey {
+		return errors.New("injected store failure")
+	}
+	return f.Storage.Store(ctx, key, value)
+}
+
+func TestStoreTxStoresAll(t *testing.T) {
+	ctx := context.Background()
+	s := &FileStorage{Path: t.TempDir()}
+
+	all := []keyValue{
+		{key: "site/example.com.key", value: []byte("key")},
+		{key: "site/example.com.crt", value: []byte("cert")},
+		{key: "site/example.com.json", value: []byte("meta")},
+	}
+	if err := storeTx(ctx, s, all); err != nil {
+		t.Fatalf("storeTx failed: %v", err)
+	}
+	for _, kv := range all {
+		actual, err := s.Load(ctx, kv.key)
+		if err != nil {
+			t.Fatalf("loading %s: %v", kv.key, err)
+		}
+		if string(actual) != string(kv.value) {
+			t.Errorf("key %s: expected %q, got %q", kv.key, kv.value, actual)
+		}
+	}
+}
+
+// TestStoreTxRollbackPreservesPrevious ensures that when one file of a
+// logical object fails to store, the files already written are rolled
+// back to their previous complete versions rather than deleted.
+func TestStoreTxRollbackPreservesPrevious(t *testing.T) {
+	ctx := context.Background()
+	s := &FileStorage{Path: t.TempDir()}
+
+	keys := []string{"site/example.com.key", "site/example.com.crt", "site/example.com.json"}
+	for _, key := range keys {
+		if err := s.Store(ctx, key, []byte("old:"+key)); err != nil {
+			t.Fatalf("storing previous version of %s: %v", key, err)
+		}
+	}
+
+	// fail on the second file of the object
+	wrapped := &failOnStore{Storage: s, failKey: keys[1]}
+	all := []keyValue{
+		{key: keys[0], value: []byte("new:key")},
+		{key: keys[1], value: []byte("new:cert")},
+		{key: keys[2], value: []byte("new:meta")},
+	}
+	if err := storeTx(ctx, wrapped, all); err == nil {
+		t.Fatal("expected storeTx to fail, but it succeeded")
+	}
+
+	// the previous complete version of the whole object must be intact
+	for _, key := range keys {
+		actual, err := s.Load(ctx, key)
+		if err != nil {
+			t.Fatalf("loading %s after rollback: %v", key, err)
+		}
+		if expected := "old:" + key; string(actual) != expected {
+			t.Errorf("key %s: expected previous version %q, got %q", key, expected, actual)
+		}
+	}
+}
+
+// TestStoreTxRollbackRemovesNewKeys ensures that keys which did not
+// exist before a failed transaction are removed by the rollback.
+func TestStoreTxRollbackRemovesNewKeys(t *testing.T) {
+	ctx := context.Background()
+	s := &FileStorage{Path: t.TempDir()}
+
+	keys := []string{"site/new.com.key", "site/new.com.crt", "site/new.com.json"}
+	wrapped := &failOnStore{Storage: s, failKey: keys[1]}
+	all := []keyValue{
+		{key: keys[0], value: []byte("key")},
+		{key: keys[1], value: []byte("cert")},
+		{key: keys[2], value: []byte("meta")},
+	}
+	if err := storeTx(ctx, wrapped, all); err == nil {
+		t.Fatal("expected storeTx to fail, but it succeeded")
+	}
+
+	for _, key := range keys {
+		if s.Exists(ctx, key) {
+			t.Errorf("key %s should not exist after rollback of a failed first publish", key)
 		}
 	}
 }

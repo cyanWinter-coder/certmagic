@@ -75,3 +75,44 @@ func TestConcurrentWrites(t *testing.T) {
 	testutil.AssertNoError(t, err, "failed to read file")
 	testutil.AssertEqual(t, content2, string(actual))
 }
+
+func TestCancelIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test-file")
+
+	f, err := atomicfile.New(path, 0o600)
+	testutil.RequireNoError(t, err, "failed to create file")
+	_, err = fmt.Fprint(f, "content that will be abandoned")
+	testutil.AssertNoError(t, err, "failed to write content")
+
+	// cancel is idempotent, and closing a canceled file is a no-op
+	err = f.Cancel()
+	testutil.RequireNoError(t, err, "failed to cancel file")
+	err = f.Cancel()
+	testutil.RequireNoError(t, err, "second cancel should be a no-op")
+	err = f.Close()
+	testutil.RequireNoError(t, err, "close after cancel should be a no-op")
+
+	_, err = os.Stat(path)
+	testutil.AssertEqual(t, true, os.IsNotExist(err), "destination should not exist after cancel")
+}
+
+func TestCloseIdempotent(t *testing.T) {
+	const content = "content published exactly once"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test-file")
+
+	f, err := atomicfile.New(path, 0o600)
+	testutil.RequireNoError(t, err, "failed to create file")
+	_, err = fmt.Fprint(f, content)
+	testutil.AssertNoError(t, err, "failed to write content")
+
+	err = f.Close()
+	testutil.RequireNoError(t, err, "failed to close file")
+	err = f.Close()
+	testutil.RequireNoError(t, err, "second close should be a no-op")
+
+	actual, err := os.ReadFile(path)
+	testutil.AssertNoError(t, err, "failed to read file")
+	testutil.AssertEqual(t, content, string(actual))
+}

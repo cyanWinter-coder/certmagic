@@ -1,11 +1,22 @@
 # atomic file
 
 
-this is copied from
+this was originally copied from
 
-https://github.com/containerd/containerd/blob/main/pkg%2Fatomicfile%2Ffile.go
+https://github.com/containerd/containerd/blob/main/pkg%2Fatomicfile/file.go
 
 
 see
 
 https://github.com/caddyserver/certmagic/issues/296
+
+
+local modifications on top of the containerd version:
+
+- Close verifies the synced temp file against a SHA-256 checksum of
+  everything written before renaming it over the destination
+- Close syncs the containing directory after the rename so the rename
+  itself is durable across crashes
+- temp files are named `.<dest>.tmp-*` so orphans left by a crash are
+  recognizable, and new writers remove stale ones (bounded cleanup)
+- Cancel is idempotent and tolerates an already-removed temp file
