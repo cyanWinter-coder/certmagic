@@ -460,37 +460,18 @@ func (am *ACMEIssuer) doIssue(ctx context.Context, csr *x509.CertificateRequest,
 		}
 	}
 
-	params, err := acmez.OrderParametersFromCSR(client.account, csr)
-	if err != nil {
-		return nil, false, fmt.Errorf("generating order parameters from CSR: %v", err)
-	}
-	if am.NotBefore != 0 {
-		params.NotBefore = time.Now().Add(am.NotBefore)
-	}
-	if am.NotAfter != 0 {
-		params.NotAfter = time.Now().Add(am.NotAfter)
-	}
-	params.Profile = am.Profile
-
-	// Notify the ACME server we are replacing a certificate (if the caller says we are),
-	// only if the following conditions are met:
-	// - The caller has set a Replaces value in the context, indicating this is a renewal.
-	// - Not using test CA. This should be obvious, but a test CA should be in a separate
-	// environment from production, and thus not have knowledge of the cert being replaced.
-	// - Not a certain attempt number. We skip setting Replaces once early on in the retries
-	// in case the reason the order is failing is only because there is a state inconsistency
-	// between client and server or some sort of bookkeeping error with regards to the certID
-	// and the server is rejecting the ARI certID. In any case, an invalid certID may cause
-	// orders to fail. So try once without setting it.
-	if !am.config.DisableARI && !usingTestCA && attempts != 2 {
-		if replacing, ok := ctx.Value(ctxKeyARIReplaces).(*x509.Certificate); ok {
-			params.Replaces = replacing
-		}
-	}
-
 	// do this in a loop because there's an error case that may necessitate a retry, but not more than once
 	var certChains []acme.Certificate
 	for range 2 {
+		// Build the order parameters fresh from THIS attempt's snapshot:
+		// each attempt captures its own account, directory, and nonce
+		// state, and nothing from a failed attempt — in particular a
+		// stale account or order — may leak into the next one.
+		params, err := am.orderParameters(ctx, client, csr, attempts)
+		if err != nil {
+			return nil, usingTestCA, err
+		}
+
 		am.Logger.Info("using ACME account",
 			zap.String("account_id", params.Account.Location),
 			zap.Strings("account_contact", params.Account.Contact))
@@ -499,25 +480,27 @@ func (am *ACMEIssuer) doIssue(ctx context.Context, csr *x509.CertificateRequest,
 		if err != nil {
 			var prob acme.Problem
 			if errors.As(err, &prob) && prob.Type == acme.ProblemTypeAccountDoesNotExist {
+				// The account we have no longer exists on the CA. We may
+				// only replay this attempt with a refreshed account if no
+				// challenge was presented yet; once a challenge is out in
+				// the world, this attempt's orders and nonces belong to a
+				// failed context and must not be reused.
+				if !client.canReplay() {
+					return nil, usingTestCA, fmt.Errorf("%v %w (ca=%s)", nameSet, err, client.acmeClient.Directory)
+				}
+
 				am.Logger.Warn("ACME account does not exist on server; attempting to recreate",
 					zap.String("account_id", client.account.Location),
 					zap.Strings("account_contact", client.account.Contact),
 					zap.String("key_location", am.storageKeyUserPrivateKey(client.acmeClient.Directory, am.getEmail())),
 					zap.Any("problem", prob))
 
-				// the account we have no longer exists on the CA, so we need to create a new one;
-				// we could use the same key pair, but this is a good opportunity to rotate keys
-				// (see https://caddy.community/t/acme-account-is-not-regenerated-when-acme-server-gets-reinstalled/22627)
-				// (basically this happens if the CA gets reset or reinstalled; usually just internal PKI)
-				err := am.deleteAccountLocally(ctx, client.iss.CA, client.account)
+				// Refresh the account and try again with a fresh snapshot.
+				// If the refresh fails, the last valid account is still in
+				// storage, but this issuance terminates immediately.
+				client, err = am.refreshAccount(ctx, useTestCA, false, client.account)
 				if err != nil {
-					return nil, usingTestCA, fmt.Errorf("%v ACME account no longer exists on CA, but resetting our local copy of the account info failed: %v", nameSet, err)
-				}
-
-				// recreate account and try again
-				client, err = am.newACMEClientWithAccount(ctx, useTestCA, false)
-				if err != nil {
-					return nil, false, err
+					return nil, usingTestCA, fmt.Errorf("%v ACME account no longer exists on CA, but refreshing it failed: %v", nameSet, err)
 				}
 				continue
 			}
@@ -539,6 +522,42 @@ func (am *ACMEIssuer) doIssue(ctx context.Context, csr *x509.CertificateRequest,
 	am.Logger.Debug("selected certificate chain", zap.String("url", preferredChain.URL))
 
 	return ic, usingTestCA, nil
+}
+
+// orderParameters derives the order parameters for one issuance attempt
+// from the CSR and the attempt's client snapshot. It must be called anew
+// for every attempt so that no state (account, directory, order) is
+// carried across failure contexts.
+func (am *ACMEIssuer) orderParameters(ctx context.Context, client *acmeClient, csr *x509.CertificateRequest, attempts int) (acmez.OrderParameters, error) {
+	params, err := acmez.OrderParametersFromCSR(client.account, csr)
+	if err != nil {
+		return params, fmt.Errorf("generating order parameters from CSR: %v", err)
+	}
+	if am.NotBefore != 0 {
+		params.NotBefore = time.Now().Add(am.NotBefore)
+	}
+	if am.NotAfter != 0 {
+		params.NotAfter = time.Now().Add(am.NotAfter)
+	}
+	params.Profile = am.Profile
+
+	// Notify the ACME server we are replacing a certificate (if the caller says we are),
+	// only if the following conditions are met:
+	// - The caller has set a Replaces value in the context, indicating this is a renewal.
+	// - Not using test CA. This should be obvious, but a test CA should be in a separate
+	// environment from production, and thus not have knowledge of the cert being replaced.
+	// - Not a certain attempt number. We skip setting Replaces once early on in the retries
+	// in case the reason the order is failing is only because there is a state inconsistency
+	// between client and server or some sort of bookkeeping error with regards to the certID
+	// and the server is rejecting the ARI certID. In any case, an invalid certID may cause
+	// orders to fail. So try once without setting it.
+	if !am.config.DisableARI && !client.usingTestCA() && attempts != 2 {
+		if replacing, ok := ctx.Value(ctxKeyARIReplaces).(*x509.Certificate); ok {
+			params.Replaces = replacing
+		}
+	}
+
+	return params, nil
 }
 
 // selectPreferredChain sorts and then filters the certificate chains to find the optimal

@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -209,14 +210,17 @@ func (am *ACMEIssuer) saveAccount(ctx context.Context, ca string, account acme.A
 	return storeTx(ctx, am.config.Storage, all)
 }
 
-// deleteAccountLocally deletes the registration info and private key of the account
-// for the given CA from storage.
-func (am *ACMEIssuer) deleteAccountLocally(ctx context.Context, ca string, account acme.Account) error {
-	primaryContact := getPrimaryContact(account)
-	if err := am.config.Storage.Delete(ctx, am.storageKeyUserReg(ca, primaryContact)); err != nil {
-		return err
+// accountKeysEqual reports whether two ACME account private keys are the same.
+func accountKeysEqual(a, b crypto.PrivateKey) bool {
+	aPEM, err := PEMEncodePrivateKey(a)
+	if err != nil {
+		return false
 	}
-	return am.config.Storage.Delete(ctx, am.storageKeyUserPrivateKey(ca, primaryContact))
+	bPEM, err := PEMEncodePrivateKey(b)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(aPEM, bPEM)
 }
 
 // setEmail does everything it can to obtain an email address

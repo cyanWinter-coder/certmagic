@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mholt/acmez/v3"
@@ -34,17 +35,29 @@ import (
 )
 
 // acmeClient holds state necessary to perform ACME operations
-// for certificate management with an ACME account. Call
+// for certificate management with an ACME account. It is a
+// per-issuance-attempt snapshot: the directory, account, and
+// HTTP client captured here belong to a single attempt and are
+// never mutated afterward, so the failure, cancellation, or
+// success of one issuance cannot pollute another. Call
 // ACMEIssuer.newACMEClientWithAccount() to get a valid one.
 type acmeClient struct {
 	iss        *ACMEIssuer
 	acmeClient *acmez.Client
 	account    acme.Account
+
+	// challengesPresented counts the challenges presented to solvers
+	// during this attempt; while it is zero, the attempt is still
+	// trivially replayable with a fresh snapshot
+	challengesPresented atomic.Int32
 }
 
 // newACMEClientWithAccount creates an ACME client ready to use with an account, including
 // loading one from storage or registering a new account with the CA if necessary. If
 // useTestCA is true, am.TestCA will be used if set; otherwise, the primary CA will be used.
+//
+// The returned value is a snapshot for a single issuance attempt (see the
+// acmeClient docs); concurrent issuances each get their own.
 func (iss *ACMEIssuer) newACMEClientWithAccount(ctx context.Context, useTestCA, interactive bool) (*acmeClient, error) {
 	// first, get underlying ACME client
 	client, err := iss.newACMEClient(useTestCA)
@@ -66,103 +79,202 @@ func (iss *ACMEIssuer) newACMEClientWithAccount(ctx context.Context, useTestCA, 
 			zap.Strings("contact", account.Contact),
 			zap.String("location", account.Location))
 
-		// synchronize this so the account is only created once
-		acctLockKey := accountRegLockKey(account)
-		err = acquireLock(ctx, iss.config.Storage, acctLockKey)
-		if err != nil {
-			return nil, fmt.Errorf("locking account registration: %v", err)
-		}
-		defer func() {
-			if err := releaseLock(ctx, iss.config.Storage, acctLockKey); err != nil {
-				iss.Logger.Error("failed to unlock account registration lock", zap.Error(err))
-			}
-		}()
-
-		// if we're not the only one waiting for this account, then by this point it should already be registered and in storage; reload it
-		account, err = iss.getAccountToUse(ctx, client.Directory)
+		account, err = iss.registerAccount(ctx, client, account, interactive)
 		if err != nil {
 			return nil, err
 		}
-
-		// if we are the only or first one waiting for this account, then proceed to register it while we have the lock
-		if account.Status == "" {
-			if iss.NewAccountFunc != nil {
-				// obtain lock here, since NewAccountFunc calls happen concurrently and they typically read and change the issuer
-				iss.mu.Lock()
-				account, err = iss.NewAccountFunc(ctx, iss, account)
-				iss.mu.Unlock()
-				if err != nil {
-					return nil, fmt.Errorf("account pre-registration callback: %v", err)
-				}
-			}
-
-			// agree to terms
-			if interactive {
-				if !iss.isAgreed() {
-					var termsURL string
-					dir, err := client.GetDirectory(ctx)
-					if err != nil {
-						return nil, fmt.Errorf("getting directory: %w", err)
-					}
-					if dir.Meta != nil {
-						termsURL = dir.Meta.TermsOfService
-					}
-					if termsURL != "" {
-						agreed := iss.askUserAgreement(termsURL)
-						if !agreed {
-							return nil, fmt.Errorf("user must agree to CA terms")
-						}
-						iss.mu.Lock()
-						iss.agreed = agreed
-						iss.mu.Unlock()
-					}
-				}
-			} else {
-				// can't prompt a user who isn't there; they should
-				// have reviewed the terms beforehand
-				iss.mu.Lock()
-				iss.agreed = true
-				iss.mu.Unlock()
-			}
-			account.TermsOfServiceAgreed = iss.isAgreed()
-
-			// associate account with external binding, if configured
-			if iss.ExternalAccount != nil {
-				err := account.SetExternalAccountBinding(ctx, client.Client, *iss.ExternalAccount)
-				if err != nil {
-					return nil, err
-				}
-			}
-
-			// create account
-			account, err = client.NewAccount(ctx, account)
-			if err != nil {
-				return nil, fmt.Errorf("registering account %v with server: %w", account.Contact, err)
-			}
-			iss.Logger.Info("new ACME account registered",
-				zap.Strings("contact", account.Contact),
-				zap.String("status", account.Status))
-
-			// persist the account to storage
-			err = iss.saveAccount(ctx, client.Directory, account)
-			if err != nil {
-				return nil, fmt.Errorf("could not save account %v: %v", account.Contact, err)
-			}
-		} else {
-			iss.Logger.Info("account has already been registered; reloaded",
-				zap.Strings("contact", account.Contact),
-				zap.String("status", account.Status),
-				zap.String("location", account.Location))
-		}
 	}
 
+	return iss.newACMEClientSnapshot(client, account), nil
+}
+
+// newACMEClientSnapshot captures client and account into a per-issuance
+// snapshot. The snapshot is never mutated after construction, so each
+// issuance attempt is isolated from every other one.
+func (iss *ACMEIssuer) newACMEClientSnapshot(client *acmez.Client, account acme.Account) *acmeClient {
 	c := &acmeClient{
 		iss:        iss,
 		acmeClient: client,
 		account:    account,
 	}
+	// wrap the solvers so we know whether this attempt is still replayable
+	for name, solver := range c.acmeClient.ChallengeSolvers {
+		c.acmeClient.ChallengeSolvers[name] = &challengeReplayTracker{Solver: solver, presented: &c.challengesPresented}
+	}
+	return c
+}
 
-	return c, nil
+// registerAccount registers account with the ACME server behind client and
+// persists it to storage. Registration is serialized across goroutines and
+// instances by a storage lock so the account is only created once; the
+// certificate phase that follows registration is not serialized. The account
+// is saved to storage only after the server has accepted it, so a failed
+// registration never destroys the last valid account in storage.
+func (iss *ACMEIssuer) registerAccount(ctx context.Context, client *acmez.Client, account acme.Account, interactive bool) (acme.Account, error) {
+	// synchronize this so the account is only created once
+	acctLockKey := accountRegLockKey(account)
+	err := acquireLock(ctx, iss.config.Storage, acctLockKey)
+	if err != nil {
+		return account, fmt.Errorf("locking account registration: %v", err)
+	}
+	defer func() {
+		if err := releaseLock(ctx, iss.config.Storage, acctLockKey); err != nil {
+			iss.Logger.Error("failed to unlock account registration lock", zap.Error(err))
+		}
+	}()
+
+	// if we're not the only one waiting for this account, then by this point it should already be registered and in storage; reload it
+	storedAccount, err := iss.getAccountToUse(ctx, client.Directory)
+	if err != nil {
+		return account, err
+	}
+	if storedAccount.Status != "" {
+		iss.Logger.Info("account has already been registered; reloaded",
+			zap.Strings("contact", storedAccount.Contact),
+			zap.String("status", storedAccount.Status),
+			zap.String("location", storedAccount.Location))
+		return storedAccount, nil
+	}
+
+	// we are the only or first one waiting for this account, so register it while we have the lock
+	return iss.createAccountLocked(ctx, client, account, interactive)
+}
+
+// createAccountLocked performs the actual account registration with the
+// server and persists the accepted account to storage. The caller must
+// hold the account registration lock.
+func (iss *ACMEIssuer) createAccountLocked(ctx context.Context, client *acmez.Client, account acme.Account, interactive bool) (acme.Account, error) {
+	var err error
+	if iss.NewAccountFunc != nil {
+		// obtain lock here, since NewAccountFunc calls happen concurrently and they typically read and change the issuer
+		iss.mu.Lock()
+		account, err = iss.NewAccountFunc(ctx, iss, account)
+		iss.mu.Unlock()
+		if err != nil {
+			return account, fmt.Errorf("account pre-registration callback: %v", err)
+		}
+	}
+
+	// agree to terms
+	if interactive {
+		if !iss.isAgreed() {
+			var termsURL string
+			dir, err := client.GetDirectory(ctx)
+			if err != nil {
+				return account, fmt.Errorf("getting directory: %w", err)
+			}
+			if dir.Meta != nil {
+				termsURL = dir.Meta.TermsOfService
+			}
+			if termsURL != "" {
+				agreed := iss.askUserAgreement(termsURL)
+				if !agreed {
+					return account, fmt.Errorf("user must agree to CA terms")
+				}
+				iss.mu.Lock()
+				iss.agreed = agreed
+				iss.mu.Unlock()
+			}
+		}
+	} else {
+		// can't prompt a user who isn't there; they should
+		// have reviewed the terms beforehand
+		iss.mu.Lock()
+		iss.agreed = true
+		iss.mu.Unlock()
+	}
+	account.TermsOfServiceAgreed = iss.isAgreed()
+
+	// associate account with external binding, if configured
+	if iss.ExternalAccount != nil {
+		err := account.SetExternalAccountBinding(ctx, client.Client, *iss.ExternalAccount)
+		if err != nil {
+			return account, err
+		}
+	}
+
+	// create account
+	account, err = client.NewAccount(ctx, account)
+	if err != nil {
+		return account, fmt.Errorf("registering account %v with server: %w", account.Contact, err)
+	}
+	iss.Logger.Info("new ACME account registered",
+		zap.Strings("contact", account.Contact),
+		zap.String("status", account.Status))
+
+	// persist the account to storage, replacing any previous account
+	// for the same contact only now that the server has accepted it
+	err = iss.saveAccount(ctx, client.Directory, account)
+	if err != nil {
+		return account, fmt.Errorf("could not save account %v: %v", account.Contact, err)
+	}
+
+	return account, nil
+}
+
+// refreshAccount replaces a failed ACME account with a newly-registered one
+// and returns a fresh client snapshot for a new issuance attempt. The
+// previously-stored account is left untouched until the replacement has been
+// successfully registered with the CA and persisted, so a failed refresh
+// never destroys the last valid account; in that case an error is returned
+// and the caller must terminate the issuance immediately.
+func (iss *ACMEIssuer) refreshAccount(ctx context.Context, useTestCA, interactive bool, failed acme.Account) (*acmeClient, error) {
+	// use a fresh client so that no state from the failed attempt's
+	// context (directory metadata, nonces, challenge bookkeeping)
+	// leaks into the next attempt
+	client, err := iss.newACMEClient(useTestCA)
+	if err != nil {
+		return nil, err
+	}
+
+	// serialize with other registrations and refreshes for this contact
+	acctLockKey := accountRegLockKey(failed)
+	err = acquireLock(ctx, iss.config.Storage, acctLockKey)
+	if err != nil {
+		return nil, fmt.Errorf("locking account registration: %v", err)
+	}
+	defer func() {
+		if err := releaseLock(ctx, iss.config.Storage, acctLockKey); err != nil {
+			iss.Logger.Error("failed to unlock account registration lock", zap.Error(err))
+		}
+	}()
+
+	// another goroutine or instance may have already replaced the failed
+	// account while we waited for the lock; if so, use theirs
+	storedAccount, err := iss.getAccountToUse(ctx, client.Directory)
+	if err == nil && storedAccount.Status != "" && !accountKeysEqual(storedAccount.PrivateKey, failed.PrivateKey) {
+		iss.Logger.Info("account has already been refreshed; reloaded",
+			zap.Strings("contact", storedAccount.Contact),
+			zap.String("status", storedAccount.Status),
+			zap.String("location", storedAccount.Location))
+		return iss.newACMEClientSnapshot(client, storedAccount), nil
+	}
+
+	// the account we have no longer exists on the CA, so we need to create a new one;
+	// we could use the same key pair, but this is a good opportunity to rotate keys
+	// (see https://caddy.community/t/acme-account-is-not-regenerated-when-acme-server-gets-reinstalled/22627)
+	// (basically this happens if the CA gets reset or reinstalled; usually just internal PKI)
+	// (a configured account key, however, cannot be rotated, so it is reused)
+	var newAcct acme.Account
+	if iss.AccountKeyPEM != "" {
+		newAcct.Contact = failed.Contact
+		newAcct.PrivateKey, err = PEMDecodePrivateKey([]byte(iss.AccountKeyPEM))
+		if err != nil {
+			return nil, fmt.Errorf("decoding configured account key: %v", err)
+		}
+	} else {
+		newAcct, err = iss.newAccount(getPrimaryContact(failed))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	newAcct, err = iss.createAccountLocked(ctx, client, newAcct, interactive)
+	if err != nil {
+		return nil, err
+	}
+
+	return iss.newACMEClientSnapshot(client, newAcct), nil
 }
 
 // newACMEClient creates a new underlying ACME client using the settings in am,
@@ -346,6 +458,40 @@ func (client *acmeClient) usingTestCA() bool {
 	return client.iss.TestCA != "" && client.acmeClient.Directory == client.iss.TestCA
 }
 
+// canReplay reports whether this snapshot's issuance attempt may still be
+// replayed with a fresh snapshot: true only while no challenge has been
+// presented to a solver yet. Once a challenge is out in the world, the
+// attempt's orders and nonces belong to a failed context and must not be
+// reused or retried in place.
+func (client *acmeClient) canReplay() bool {
+	return client.challengesPresented.Load() == 0
+}
+
+// challengeReplayTracker wraps a Solver to record when challenges are
+// presented during an issuance attempt, so the issuer knows whether the
+// attempt may still be replayed with a fresh snapshot.
+type challengeReplayTracker struct {
+	acmez.Solver
+	presented *atomic.Int32
+}
+
+// Present records that a challenge has been presented in this attempt,
+// then delegates to the wrapped solver.
+func (t *challengeReplayTracker) Present(ctx context.Context, chal acme.Challenge) error {
+	t.presented.Add(1)
+	return t.Solver.Present(ctx, chal)
+}
+
+// Wait implements acmez.Waiter by forwarding to the wrapped solver if it
+// is itself a Waiter, so that wrapping a solver does not hide that
+// capability from the ACME client.
+func (t *challengeReplayTracker) Wait(ctx context.Context, chal acme.Challenge) error {
+	if waiter, ok := t.Solver.(acmez.Waiter); ok {
+		return waiter.Wait(ctx, chal)
+	}
+	return nil
+}
+
 func (client *acmeClient) revoke(ctx context.Context, cert *x509.Certificate, reason int) error {
 	return client.acmeClient.RevokeCertificate(ctx, client.account,
 		cert, client.account.PrivateKey, reason)
@@ -414,4 +560,10 @@ var (
 var (
 	UserAgent   string
 	HTTPTimeout = 30 * time.Second
+)
+
+// Interface guards
+var (
+	_ acmez.Solver = (*challengeReplayTracker)(nil)
+	_ acmez.Waiter = (*challengeReplayTracker)(nil)
 )
