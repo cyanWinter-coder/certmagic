@@ -25,6 +25,7 @@ import (
 	"path"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mholt/acmez/v3/acme"
@@ -77,6 +78,10 @@ func (certCache *Cache) maintainAssets(panicCount int) {
 		case <-certCache.stopChan:
 			renewalTicker.Stop()
 			ocspTicker.Stop()
+			// stop accepting new maintenance tasks and give started ones
+			// a bounded grace period to converge, so that stopping the
+			// cache is a deterministic commit boundary for operators
+			certCache.stopMaintenanceScheduler(maintenanceShutdownGrace)
 			log.Info("stopped background certificate maintenance")
 			close(certCache.doneChan)
 			return
@@ -255,43 +260,70 @@ func (certCache *Cache) queueRenewalTask(ctx context.Context, oldCert Certificat
 		zap.Strings("identifiers", oldCert.Names),
 		zap.Duration("remaining", timeLeft))
 
-	// Queue up this renewal job (is a no-op if already active or queued,
-	// e.g. because this same certificate was independently queued for
-	// renewal elsewhere, such as manageOne or an on-demand handshake).
-	// Since this job makes only a single attempt (renewCertOnce) instead of
-	// looping internally for up to maxRetryDuration, it will not block
-	// future maintenance ticks from making progress once it returns.
-	jm.Submit(cfg.Logger, jobName, func() error {
-		timeLeft := expiresAt(oldCert.Leaf).Sub(time.Now().UTC())
-		log.Info("attempting certificate renewal",
-			zap.Strings("identifiers", oldCert.Names),
-			zap.Duration("remaining", timeLeft))
+	// Queue up this renewal job with the maintenance scheduler, which
+	// partitions tasks by issuer (so one issuer's failures cannot starve
+	// renewals of certificates from other issuers) and merges duplicate
+	// tasks for the same certificate (is a no-op if already queued, e.g.
+	// because this same certificate was independently queued for renewal
+	// elsewhere, such as manageOne or an on-demand handshake). Since this
+	// job makes only a single attempt (renewCertOnce) instead of looping
+	// internally for up to maxRetryDuration, it will not block future
+	// maintenance ticks from making progress once it returns.
+	certCache.maintenanceScheduler().submit(maintenanceTask{
+		kind:     taskKindRenewal,
+		issuer:   oldCert.issuerKey,
+		identity: jobName,
+		deadline: renewalPriority(expiresAt(oldCert.Leaf)),
+		logger:   cfg.Logger,
+		run: func(schedCtx context.Context) error {
+			// honor both the caller's context and the scheduler's, which
+			// is cancelled if maintenance shuts down before we finish
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			stopWatching := context.AfterFunc(schedCtx, cancel)
+			defer stopWatching()
 
-		// perform renewal - crucially, this happens OUTSIDE a lock on certCache
-		err := cfg.renewCertOnce(ctx, renewName, false)
-		if err != nil {
-			if cfg.OnDemand != nil {
-				// loaded dynamically, remove dynamically
-				certCache.mu.Lock()
-				certCache.removeCertificate(oldCert)
-				certCache.mu.Unlock()
-			}
-			if exhausted := renewalRetrySchedule.recordFailure(jobName, time.Now()); exhausted {
-				log.Error("final attempt; giving up until next scheduled renewal check finds the certificate still needs renewal",
-					zap.Strings("identifiers", oldCert.Names),
-					zap.Error(err))
-			}
-			return fmt.Errorf("%v %v", oldCert.Names, err)
-		}
-		renewalRetrySchedule.clear(jobName)
+			timeLeft := expiresAt(oldCert.Leaf).Sub(time.Now().UTC())
+			log.Info("attempting certificate renewal",
+				zap.Strings("identifiers", oldCert.Names),
+				zap.Duration("remaining", timeLeft))
 
-		// successful renewal, so update in-memory cache by loading
-		// renewed certificate so it will be used with handshakes
-		_, err = cfg.reloadManagedCertificate(ctx, oldCert)
-		if err != nil {
-			return ErrNoRetry{fmt.Errorf("%v %v", oldCert.Names, err)}
-		}
-		return nil
+			// perform renewal - crucially, this happens OUTSIDE a lock on certCache
+			err := cfg.renewCertOnce(ctx, renewName, false)
+			if err != nil {
+				if cfg.OnDemand != nil {
+					// loaded dynamically, remove dynamically
+					certCache.mu.Lock()
+					certCache.removeCertificate(oldCert)
+					certCache.mu.Unlock()
+				}
+				// don't penalize the certificate for an attempt we
+				// cancelled ourselves during shutdown
+				if ctx.Err() == nil {
+					// if the CA told us when to come back (ARI Retry-After),
+					// honor that wait (capped) instead of just our own schedule
+					var serverWait time.Duration
+					if oldCert.ari.RetryAfter != nil {
+						serverWait = time.Until(*oldCert.ari.RetryAfter)
+					}
+					if exhausted := renewalRetrySchedule.recordFailureWithServerWait(jobName, time.Now(), serverWait); exhausted {
+						log.Error("final attempt; giving up until next scheduled renewal check finds the certificate still needs renewal",
+							zap.Strings("identifiers", oldCert.Names),
+							zap.Error(err))
+					}
+				}
+				return fmt.Errorf("%v %v", oldCert.Names, err)
+			}
+			renewalRetrySchedule.clear(jobName)
+
+			// successful renewal, so update in-memory cache by loading
+			// renewed certificate so it will be used with handshakes
+			_, err = cfg.reloadManagedCertificate(ctx, oldCert)
+			if err != nil {
+				return ErrNoRetry{fmt.Errorf("%v %v", oldCert.Names, err)}
+			}
+			return nil
+		},
 	})
 
 	return nil
@@ -323,6 +355,8 @@ func (certCache *Cache) updateOCSPStaples(ctx context.Context) {
 		cfg     *Config
 	}
 	updated := make(map[string]ocspUpdate)
+	var updatedMu sync.Mutex           // guards updated, which tasks write concurrently
+	var renewQueueMu sync.Mutex        // guards renewQueue, which tasks append to concurrently
 	var updateQueue []updateQueueEntry // certs that need a refreshed staple
 	var renewQueue []renewQueueEntry   // certs that need to be renewed (due to revocation)
 
@@ -361,58 +395,86 @@ func (certCache *Cache) updateOCSPStaples(ctx context.Context) {
 	}
 	certCache.mu.RUnlock()
 
-	// perform updates outside of any lock on certCache
+	// Perform updates outside of any lock on certCache. Each refresh is
+	// submitted to the maintenance scheduler, which partitions tasks by
+	// issuer (so one issuer's unreachable responder cannot stall staple
+	// updates for certificates from other issuers), schedules them by
+	// staple urgency, and merges duplicates of the same certificate.
+	var handles []maintenanceTaskHandle
 	for _, qe := range updateQueue {
-		cert := qe.cert
-		certHash := qe.certHash
-		lastNextUpdate := qe.lastNextUpdate
-
 		if qe.cfg == nil {
 			// this is bad if this happens, probably a programmer error (oops)
 			logger.Error("no configuration associated with certificate; unable to manage OCSP staples",
-				zap.Strings("identifiers", cert.Names))
+				zap.Strings("identifiers", qe.cert.Names))
 			continue
 		}
 
-		// this is the background refresher, so read storage rather than the
-		// local cache to pick up staples refreshed by other instances
-		err := stapleOCSP(ctx, qe.cfg.OCSP, qe.cfg.groundTruthStorage(), &cert, nil)
-		if err != nil {
-			if cert.ocsp != nil {
-				// if there was no staple before, that's fine; otherwise we should log the error
-				logger.Error("stapling OCSP",
-					zap.Strings("identifiers", cert.Names),
-					zap.Error(err))
-			}
-			continue
-		}
+		handle := certCache.maintenanceScheduler().submit(maintenanceTask{
+			kind:     taskKindOCSP,
+			issuer:   qe.cert.issuerKey,
+			identity: "ocsp_" + qe.certHash,
+			deadline: ocspPriority(qe.lastNextUpdate),
+			logger:   qe.cfg.Logger,
+			run: func(ctx context.Context) error {
+				cert := qe.cert
+				lastNextUpdate := qe.lastNextUpdate
 
-		// By this point, we've obtained the latest OCSP response.
-		// If there was no staple before, or if the response is updated, make
-		// sure we apply the update to all names on the certificate if
-		// the status is still Good.
-		if cert.ocsp != nil && cert.ocsp.Status == ocsp.Good && (lastNextUpdate.IsZero() || lastNextUpdate != cert.ocsp.NextUpdate) {
-			logger.Info("advancing OCSP staple",
-				zap.Strings("identifiers", cert.Names),
-				zap.Time("from", lastNextUpdate),
-				zap.Time("to", cert.ocsp.NextUpdate))
-			updated[certHash] = ocspUpdate{rawBytes: cert.Certificate.OCSPStaple, parsed: cert.ocsp}
-		}
+				// this is the background refresher, so read storage rather than the
+				// local cache to pick up staples refreshed by other instances
+				err := stapleOCSP(ctx, qe.cfg.OCSP, qe.cfg.groundTruthStorage(), &cert, nil)
+				if err != nil {
+					if cert.ocsp != nil {
+						// if there was no staple before, that's fine; otherwise we should log the error
+						logger.Error("stapling OCSP",
+							zap.Strings("identifiers", cert.Names),
+							zap.Error(err))
+					}
+					return nil // a failed refresh is not fatal to the maintenance pass
+				}
 
-		// If the updated staple shows that the certificate was revoked, we should immediately renew it
-		if certShouldBeForceRenewed(cert) {
-			qe.cfg.emit(ctx, "cert_ocsp_revoked", map[string]any{
-				"subjects":    cert.Names,
-				"certificate": cert,
-				"reason":      cert.ocsp.RevocationReason,
-				"revoked_at":  cert.ocsp.RevokedAt,
-			})
+				// By this point, we've obtained the latest OCSP response.
+				// If there was no staple before, or if the response is updated, make
+				// sure we apply the update to all names on the certificate if
+				// the status is still Good.
+				if cert.ocsp != nil && cert.ocsp.Status == ocsp.Good && (lastNextUpdate.IsZero() || lastNextUpdate != cert.ocsp.NextUpdate) {
+					logger.Info("advancing OCSP staple",
+						zap.Strings("identifiers", cert.Names),
+						zap.Time("from", lastNextUpdate),
+						zap.Time("to", cert.ocsp.NextUpdate))
+					updatedMu.Lock()
+					updated[qe.certHash] = ocspUpdate{rawBytes: cert.Certificate.OCSPStaple, parsed: cert.ocsp}
+					updatedMu.Unlock()
+				}
 
-			renewQueue = append(renewQueue, renewQueueEntry{
-				oldCert: cert,
-				cfg:     qe.cfg,
-			})
-		}
+				// If the updated staple shows that the certificate was revoked, we should immediately renew it
+				if certShouldBeForceRenewed(cert) {
+					qe.cfg.emit(ctx, "cert_ocsp_revoked", map[string]any{
+						"subjects":    cert.Names,
+						"certificate": cert,
+						"reason":      cert.ocsp.RevocationReason,
+						"revoked_at":  cert.ocsp.RevokedAt,
+					})
+
+					renewQueueMu.Lock()
+					renewQueue = append(renewQueue, renewQueueEntry{
+						oldCert: cert,
+						cfg:     qe.cfg,
+					})
+					renewQueueMu.Unlock()
+				}
+				return nil
+			},
+		})
+		handles = append(handles, handle)
+	}
+
+	// Deterministic commit boundary: this maintenance pass applies no
+	// staple updates to the cache until every refresh task it submitted
+	// has settled (completed, merged, or been dropped at shutdown). If
+	// the pass's context is cancelled first, we commit whatever results
+	// completed before the boundary.
+	for _, handle := range handles {
+		handle.wait(ctx)
 	}
 
 	// These write locks should be brief since we have all the info we need now.

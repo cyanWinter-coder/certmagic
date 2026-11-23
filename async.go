@@ -29,9 +29,10 @@ type namedJob struct {
 
 // Submit enqueues the given job with the given name. If name is non-empty
 // and a job with the same name is already enqueued or running, this is a
-// no-op. If name is empty, no duplicate prevention will occur. The job
-// manager will then run this job as soon as it is able.
-func (jm *jobManager) Submit(logger *zap.Logger, name string, job func() error) {
+// no-op and Submit returns false. If name is empty, no duplicate prevention
+// will occur. The job manager will then run this job as soon as it is able.
+// It returns true if the job was enqueued.
+func (jm *jobManager) Submit(logger *zap.Logger, name string, job func() error) bool {
 	jm.mu.Lock()
 	defer jm.mu.Unlock()
 	if jm.names == nil {
@@ -40,7 +41,7 @@ func (jm *jobManager) Submit(logger *zap.Logger, name string, job func() error) 
 	if name != "" {
 		// prevent duplicate jobs
 		if _, ok := jm.names[name]; ok {
-			return
+			return false
 		}
 		jm.names[name] = struct{}{}
 	}
@@ -49,6 +50,7 @@ func (jm *jobManager) Submit(logger *zap.Logger, name string, job func() error) 
 		jm.activeWorkers++
 		go jm.worker()
 	}
+	return true
 }
 
 func (jm *jobManager) worker() {
@@ -140,14 +142,26 @@ func (rb *renewalBackoff) readyForAsOf(name string, asOf time.Time) bool {
 }
 
 // recordFailure schedules the next allowed attempt for name using the same
-// retryIntervals/maxRetryDuration schedule as doWithRetry. It reports
-// whether the overall retry budget (maxRetryDuration since the first
-// recorded failure in this cycle) has been exhausted. If exhausted, the
+// retryIntervals/maxRetryDuration schedule as doWithRetry. It is shorthand
+// for recordFailureWithServerWait with no server-requested wait.
+func (rb *renewalBackoff) recordFailure(name string, now time.Time) (exhausted bool) {
+	return rb.recordFailureWithServerWait(name, now, 0)
+}
+
+// recordFailureWithServerWait is like recordFailure, but additionally
+// honors a server-requested wait (serverWait, e.g. derived from an ACME
+// Renewal Info Retry-After) when it is longer than our own backoff
+// interval: the next attempt is scheduled no sooner than the server asked
+// us to come back. The effective wait is capped at maxRenewalBackoff so a
+// hostile or buggy server cannot postpone renewal indefinitely.
+//
+// It reports whether the overall retry budget (maxRetryDuration since the
+// first recorded failure in this cycle) has been exhausted. If exhausted, the
 // backoff cycle for name is reset (mirroring doWithRetry's own behavior of
 // giving up and returning), so the next maintenance tick will attempt
 // immediately rather than being throttled forever; if the certificate still
 // needs renewal by then, a fresh backoff cycle begins.
-func (rb *renewalBackoff) recordFailure(name string, now time.Time) (exhausted bool) {
+func (rb *renewalBackoff) recordFailureWithServerWait(name string, now time.Time, serverWait time.Duration) (exhausted bool) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 	if rb.state == nil {
@@ -165,7 +179,14 @@ func (rb *renewalBackoff) recordFailure(name string, now time.Time) (exhausted b
 	if st.intervalIdx < len(retryIntervals)-1 {
 		st.intervalIdx++
 	}
-	st.nextAttempt = now.Add(retryIntervals[st.intervalIdx])
+	interval := retryIntervals[st.intervalIdx]
+	if serverWait > interval {
+		interval = serverWait
+	}
+	if interval > maxRenewalBackoff {
+		interval = maxRenewalBackoff
+	}
+	st.nextAttempt = now.Add(interval)
 	return false
 }
 
@@ -288,3 +309,9 @@ var retryIntervals = []time.Duration{
 // maxRetryDuration is the maximum duration to try
 // doing retries using the above intervals.
 const maxRetryDuration = 24 * time.Hour * 30
+
+// maxRenewalBackoff caps how far into the future a single failed
+// renewal's next attempt may be scheduled. It bounds server-requested
+// waits (e.g. ARI Retry-After) so they are honored but cannot push a
+// certificate's renewal out indefinitely.
+const maxRenewalBackoff = 24 * time.Hour

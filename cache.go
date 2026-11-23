@@ -66,6 +66,12 @@ type Cache struct {
 	// Used to signal when stopping is completed
 	doneChan chan struct{}
 
+	// sched coordinates issuer-partitioned maintenance tasks (renewal
+	// and OCSP); it is created lazily by maintenanceScheduler() and
+	// stopped when background maintenance stops
+	sched   *maintenanceScheduler
+	schedMu sync.Mutex
+
 	logger *zap.Logger
 }
 
